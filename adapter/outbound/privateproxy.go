@@ -133,29 +133,39 @@ func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Meta
 }
 
 func (p *PrivateProxy) readyTunnel() privateProxyTunnel {
+	return p.selectTunnel(true)
+}
+
+func (p *PrivateProxy) liveTunnel() privateProxyTunnel {
+	return p.selectTunnel(false)
+}
+
+func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed || len(p.tunnels) == 0 {
 		return nil
 	}
 
-	start := int(p.next.Add(1)-1) % len(p.tunnels)
 	live := 0
-	var selected privateProxyTunnel
-	for offset := range len(p.tunnels) {
-		t := p.tunnels[(start+offset)%len(p.tunnels)]
+	for _, t := range p.tunnels {
 		if t == nil || t.IsClosed() {
 			continue
 		}
 		live++
-		if selected == nil {
-			selected = t
-		}
 	}
-	if live < p.option.SessionPool {
+	if live == 0 || (requireFullPool && live < p.option.SessionPool) {
 		return nil
 	}
-	return selected
+
+	start := int(p.next.Add(1)-1) % len(p.tunnels)
+	for offset := range len(p.tunnels) {
+		t := p.tunnels[(start+offset)%len(p.tunnels)]
+		if t != nil && !t.IsClosed() {
+			return t
+		}
+	}
+	return nil
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {
@@ -192,6 +202,12 @@ func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunne
 	log.Infoln("privateproxy: connecting to %s on demand (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
 	t, err := p.dialTunnel(ctx, entry, p.option.PSK)
 	if err != nil {
+		if ctx.Err() == nil {
+			if fallback := p.liveTunnel(); fallback != nil {
+				log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session: %v", p.addr, err)
+				return fallback, nil
+			}
+		}
 		return nil, err
 	}
 	p.mu.Lock()

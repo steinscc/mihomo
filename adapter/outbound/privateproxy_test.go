@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 
@@ -122,5 +123,40 @@ func TestPrivateProxyBuildsAndReusesPoolOnDemand(t *testing.T) {
 	}
 	if !first.IsClosed() || !second.IsClosed() {
 		t.Fatal("closing the adapter must close every pooled session")
+	}
+}
+
+func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "partial-pool-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	dials := 0
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		dials++
+		if dials == 2 {
+			return nil, errors.New("refill unavailable")
+		}
+		return &fakePrivateProxyTunnel{}, nil
+	}
+
+	healthy, err := proxy.getOrCreateTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("create first session: %v", err)
+	}
+	fallback, err := proxy.getOrCreateTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("partial pool should remain usable after refill failure: %v", err)
+	}
+	if fallback != healthy {
+		t.Fatal("refill failure should fall back to the existing healthy session")
+	}
+	if dials != 2 {
+		t.Fatalf("dial count: got %d, want 2", dials)
 	}
 }
