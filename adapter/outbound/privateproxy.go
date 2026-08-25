@@ -54,12 +54,13 @@ type privateProxyTunnel interface {
 	DialContext(context.Context, string) (net.Conn, error)
 	Close() error
 	IsClosed() bool
+	NumStreams() int
 }
 
 type privateProxyTunnelDialer func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error)
 
 const (
-	defaultPrivateProxySessionPool = 2
+	defaultPrivateProxySessionPool = 4
 	maxPrivateProxySessionPool     = 4
 )
 
@@ -187,14 +188,32 @@ func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
 		return nil
 	}
 
-	start := int(p.next.Add(1)-1) % len(p.tunnels)
-	for offset := range len(p.tunnels) {
-		t := p.tunnels[(start+offset)%len(p.tunnels)]
-		if t != nil && !t.IsClosed() {
-			return t
+	minStreams := int(^uint(0) >> 1)
+	var leastLoaded [maxPrivateProxySessionPool]privateProxyTunnel
+	tieCount := 0
+	for _, t := range p.tunnels {
+		if t == nil || t.IsClosed() {
+			continue
+		}
+		streams := t.NumStreams()
+		if streams < minStreams {
+			minStreams = streams
+			tieCount = 1
+			leastLoaded[0] = t
+		} else if streams == minStreams {
+			tieCount++
+			leastLoaded[tieCount-1] = t
 		}
 	}
-	return nil
+	if tieCount == 0 {
+		return nil
+	}
+
+	// Keep round-robin fairness among tunnels with the same load. Using the
+	// atomic ticket over the tied set avoids repeatedly selecting the first
+	// minimum when the least-loaded tunnels are not adjacent in the pool.
+	target := int((p.next.Add(1) - 1) % uint64(tieCount))
+	return leastLoaded[target]
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {

@@ -17,7 +17,8 @@ import (
 )
 
 type fakePrivateProxyTunnel struct {
-	closed bool
+	closed  bool
+	streams int
 }
 
 func (t *fakePrivateProxyTunnel) DialContext(context.Context, string) (net.Conn, error) {
@@ -30,6 +31,8 @@ func (t *fakePrivateProxyTunnel) Close() error {
 }
 
 func (t *fakePrivateProxyTunnel) IsClosed() bool { return t.closed }
+
+func (t *fakePrivateProxyTunnel) NumStreams() int { return t.streams }
 
 type recordingDialer struct {
 	mu      sync.Mutex
@@ -55,6 +58,7 @@ type scriptedPrivateProxyTunnel struct {
 	mu      sync.Mutex
 	closed  bool
 	dialErr error
+	streams int
 }
 
 func (t *scriptedPrivateProxyTunnel) DialContext(context.Context, string) (net.Conn, error) {
@@ -82,6 +86,12 @@ func (t *scriptedPrivateProxyTunnel) IsClosed() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.closed
+}
+
+func (t *scriptedPrivateProxyTunnel) NumStreams() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.streams
 }
 
 type privateProxyResolver struct {
@@ -133,6 +143,28 @@ func TestNewPrivateProxyIsLazy(t *testing.T) {
 	}
 	if proxy.option.SessionPool != defaultPrivateProxySessionPool {
 		t.Fatalf("default session pool: got %d, want %d", proxy.option.SessionPool, defaultPrivateProxySessionPool)
+	}
+}
+
+func TestPrivateProxySelectsLeastLoadedTunnelWithRoundRobinTies(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "load-balance-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leastLoadedA := &fakePrivateProxyTunnel{streams: 1}
+	leastLoadedB := &fakePrivateProxyTunnel{streams: 1}
+	mostLoaded := &fakePrivateProxyTunnel{streams: 4}
+	proxy.tunnels = []privateProxyTunnel{mostLoaded, leastLoadedA, leastLoadedB}
+
+	for i, want := range []privateProxyTunnel{leastLoadedA, leastLoadedB, leastLoadedA, leastLoadedB} {
+		got := proxy.selectTunnel(true)
+		if got != want {
+			t.Fatalf("selection %d: got %p, want %p", i, got, want)
+		}
 	}
 }
 
