@@ -207,10 +207,10 @@ func TestNewPrivateProxyIsLazy(t *testing.T) {
 	}
 }
 
-func TestPrivateProxySelectsLeastLoadedTunnelWithRoundRobinTies(t *testing.T) {
+func TestPrivateProxyReservationsBalanceLeastLoadedTies(t *testing.T) {
 	proxy, err := NewPrivateProxy(PrivateProxyOption{
 		Name: "load-balance-test", Server: "proxy.example.com",
-		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 3,
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 3, MaxStreamsPerSession: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -223,11 +223,19 @@ func TestPrivateProxySelectsLeastLoadedTunnelWithRoundRobinTies(t *testing.T) {
 		{tunnel: mostLoaded}, {tunnel: leastLoadedA}, {tunnel: leastLoadedB},
 	}
 
-	for i, want := range []privateProxyTunnel{leastLoadedA, leastLoadedB, leastLoadedA, leastLoadedB} {
-		got := proxy.selectTunnel(true)
-		if got != want {
-			t.Fatalf("selection %d: got %p, want %p", i, got, want)
-		}
+	first, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		first.release()
+		t.Fatal(err)
+	}
+	defer first.release()
+	defer second.release()
+	if first.tunnel() != leastLoadedA || second.tunnel() != leastLoadedB {
+		t.Fatalf("tie reservations: got %p/%p, want %p/%p", first.tunnel(), second.tunnel(), leastLoadedA, leastLoadedB)
 	}
 }
 

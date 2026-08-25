@@ -56,7 +56,6 @@ type PrivateProxy struct {
 	dialMu     sync.Mutex
 	tunnels    []*privateProxyTunnelState
 	dialTunnel privateProxyTunnelDialer
-	next       atomic.Uint64
 	closed     bool
 }
 
@@ -208,60 +207,6 @@ func shouldRetryPrivateProxyDial(t privateProxyTunnel, err error) bool {
 
 func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	return nil, fmt.Errorf("privateproxy: UDP not supported")
-}
-
-func (p *PrivateProxy) readyTunnel() privateProxyTunnel {
-	return p.selectTunnel(true)
-}
-
-func (p *PrivateProxy) liveTunnel() privateProxyTunnel {
-	return p.selectTunnel(false)
-}
-
-func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed || len(p.tunnels) == 0 {
-		return nil
-	}
-
-	live := 0
-	for _, state := range p.tunnels {
-		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
-			continue
-		}
-		live++
-	}
-	if live == 0 || (requireFullPool && live < p.option.SessionPool) {
-		return nil
-	}
-
-	minStreams := int(^uint(0) >> 1)
-	var leastLoaded [maxPrivateProxySessionPool]privateProxyTunnel
-	tieCount := 0
-	for _, state := range p.tunnels {
-		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
-			continue
-		}
-		streams := state.tunnel.NumStreams() + int(state.pending.Load())
-		if streams < minStreams {
-			minStreams = streams
-			tieCount = 1
-			leastLoaded[0] = state.tunnel
-		} else if streams == minStreams {
-			tieCount++
-			leastLoaded[tieCount-1] = state.tunnel
-		}
-	}
-	if tieCount == 0 {
-		return nil
-	}
-
-	// Keep round-robin fairness among tunnels with the same load. Using the
-	// atomic ticket over the tied set avoids repeatedly selecting the first
-	// minimum when the least-loaded tunnels are not adjacent in the pool.
-	target := int((p.next.Add(1) - 1) % uint64(tieCount))
-	return leastLoaded[target]
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {
@@ -458,21 +403,15 @@ func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
 func (p *PrivateProxy) removeTunnel(target privateProxyTunnel) {
 	p.mu.Lock()
 	live := p.tunnels[:0]
-	var removed []privateProxyTunnel
 	for _, state := range p.tunnels {
 		if state == nil || !samePrivateProxyTunnel(state.tunnel, target) {
 			live = append(live, state)
-		} else if state.tunnel != nil {
-			removed = append(removed, state.tunnel)
 		}
 	}
 	p.tunnels = live
 	p.mu.Unlock()
 	if target != nil {
-		removed = append(removed, target)
-	}
-	for _, current := range removed {
-		_ = current.Close()
+		_ = target.Close()
 	}
 }
 
