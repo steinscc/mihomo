@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,8 +32,8 @@ type PrivateProxyOption struct {
 	CAFile string `proxy:"ca_file,omitempty"`
 	// SPKIPins contains base64 SHA-256 SubjectPublicKeyInfo digests.
 	SPKIPins []string `proxy:"spki_pins,omitempty"`
-	// Transport is tls-yamux by default. http2/http3 are reserved for V2
-	// builds that register the corresponding transport adapter.
+	// Transport is tls-yamux by default. http3 selects the V2 QUIC adapter;
+	// http2 remains reserved.
 	Transport string `proxy:"transport,omitempty"`
 	// SessionPool is the number of independent TLS/yamux sessions opened on
 	// demand. It is a maximum connection count; sessions are added only when
@@ -438,6 +440,26 @@ func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
 	}
 	if p.dialer != nil {
 		entry.RawDialContext = p.dialer.DialContext
+		entry.RawPacketDialContext = func(ctx context.Context, address string) (net.PacketConn, net.Addr, error) {
+			host, portText, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, nil, err
+			}
+			port, err := strconv.Atoi(portText)
+			if err != nil || port < 1 || port > 65535 {
+				return nil, nil, fmt.Errorf("invalid UDP port %q", portText)
+			}
+			ip, err := resolver.ResolveIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
+			if err != nil {
+				return nil, nil, err
+			}
+			remote := netip.AddrPortFrom(ip, uint16(port))
+			packetConn, err := p.dialer.ListenPacket(ctx, "udp", "", remote)
+			if err != nil {
+				return nil, nil, err
+			}
+			return packetConn, net.UDPAddrFromAddrPort(remote), nil
+		}
 	}
 	return entry
 }

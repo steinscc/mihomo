@@ -291,6 +291,9 @@ func TestPrivateProxyPropagatesBasicOptionsAndInjectsDialer(t *testing.T) {
 	if gotNetwork != "tcp4" || gotAddress != "proxy.example.com:443" {
 		t.Fatalf("raw dial arguments: got %s %s", gotNetwork, gotAddress)
 	}
+	if entry.RawPacketDialContext == nil {
+		t.Fatal("privateproxy server entry must inject the Mihomo packet dialer")
+	}
 }
 
 func TestPrivateProxyUsesProxyServerResolverForRawDial(t *testing.T) {
@@ -332,6 +335,27 @@ func TestPrivateProxyUsesProxyServerResolverForRawDial(t *testing.T) {
 	_ = conn.Close()
 	if err := <-acceptErr; err != nil {
 		t.Fatalf("accept raw dial: %v", err)
+	}
+
+	udpListener, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpListener.Close()
+	if entry.RawPacketDialContext == nil {
+		t.Fatal("privateproxy server entry must inject a raw packet dialer")
+	}
+	udpPort := udpListener.LocalAddr().(*net.UDPAddr).Port
+	packetConn, remoteAddr, err := entry.RawPacketDialContext(
+		context.Background(), "proxy.example.com:"+strconv.Itoa(udpPort),
+	)
+	if err != nil {
+		t.Fatalf("raw packet dial through proxy resolver: %v", err)
+	}
+	defer packetConn.Close()
+	remoteUDP, ok := remoteAddr.(*net.UDPAddr)
+	if !ok || !remoteUDP.IP.Equal(net.ParseIP("127.0.0.1")) || remoteUDP.Port != udpPort {
+		t.Fatalf("resolved UDP address: got %v", remoteAddr)
 	}
 }
 
