@@ -66,6 +66,7 @@ type PrivateProxy struct {
 
 type privateProxyTunnel interface {
 	DialContext(context.Context, string) (net.Conn, error)
+	ListenPacketContext(context.Context) (net.PacketConn, error)
 	Close() error
 	IsClosed() bool
 	NumStreams() int
@@ -138,13 +139,14 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 	}
 
 	addr := net.JoinHostPort(option.Server, fmt.Sprintf("%d", option.Port))
+	udpEnabled := strings.EqualFold(strings.TrimSpace(option.Transport), "http3")
 	p := &PrivateProxy{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
 			Addr:         addr,
 			Type:         C.Compatible,
 			ProviderName: option.ProviderName,
-			UDP:          false,
+			UDP:          udpEnabled,
 			TFO:          option.TFO,
 			MPTCP:        option.MPTCP,
 			Interface:    option.Interface,
@@ -213,7 +215,40 @@ func shouldRetryPrivateProxyDial(t privateProxyTunnel, err error) bool {
 }
 
 func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	return nil, fmt.Errorf("privateproxy: UDP not supported")
+	if !p.SupportUDP() {
+		return nil, fmt.Errorf("privateproxy: UDP requires transport http3")
+	}
+	if metadata == nil {
+		return nil, errors.New("privateproxy: metadata is nil")
+	}
+	if err := p.ResolveUDP(ctx, metadata); err != nil {
+		return nil, err
+	}
+	reservation, err := p.reserveTunnel(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("privateproxy UDP tunnel: %w", err)
+	}
+	t := reservation.tunnel()
+	packetConn, err := t.ListenPacketContext(ctx)
+	reservation.release()
+	if err != nil && shouldRetryPrivateProxyDial(t, err) && ctx.Err() == nil {
+		p.removeTunnel(t)
+		if replacementReservation, replacementErr := p.reserveTunnel(ctx); replacementErr == nil {
+			replacement := replacementReservation.tunnel()
+			packetConn, err = replacement.ListenPacketContext(ctx)
+			replacementReservation.release()
+			if err != nil && shouldRetryPrivateProxyDial(replacement, err) {
+				p.removeTunnel(replacement)
+			}
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("privateproxy UDP association: %w", err)
+	}
+	if packetConn == nil {
+		return nil, errors.New("privateproxy UDP association returned nil")
+	}
+	return NewPacketConn(packetConn, p), nil
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {
@@ -490,7 +525,9 @@ func samePrivateProxyTunnel(a, b privateProxyTunnel) bool {
 	return a == b
 }
 
-func (p *PrivateProxy) SupportUDP() bool { return false }
+func (p *PrivateProxy) SupportUDP() bool {
+	return p != nil && strings.EqualFold(strings.TrimSpace(p.option.Transport), "http3")
+}
 
 func (p *PrivateProxy) Alive() bool {
 	p.mu.RLock()

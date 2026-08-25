@@ -27,6 +27,10 @@ func (t *fakePrivateProxyTunnel) DialContext(context.Context, string) (net.Conn,
 	return nil, net.ErrClosed
 }
 
+func (t *fakePrivateProxyTunnel) ListenPacketContext(context.Context) (net.PacketConn, error) {
+	return nil, net.ErrClosed
+}
+
 func (t *fakePrivateProxyTunnel) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -93,6 +97,18 @@ func (t *scriptedPrivateProxyTunnel) DialContext(context.Context, string) (net.C
 	return conn, nil
 }
 
+func (t *scriptedPrivateProxyTunnel) ListenPacketContext(context.Context) (net.PacketConn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.dialErr != nil {
+		return nil, t.dialErr
+	}
+	return &privateProxyTestPacketConn{}, nil
+}
+
 func (t *scriptedPrivateProxyTunnel) Close() error {
 	t.mu.Lock()
 	t.closed = true
@@ -132,6 +148,32 @@ func (t *dialResultPrivateProxyTunnel) DialContext(context.Context, string) (net
 	_ = peer.Close()
 	return conn, nil
 }
+
+func (t *dialResultPrivateProxyTunnel) ListenPacketContext(context.Context) (net.PacketConn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.err != nil {
+		return nil, t.err
+	}
+	return &privateProxyTestPacketConn{}, nil
+}
+
+type privateProxyTestPacketConn struct{}
+
+func (*privateProxyTestPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+func (*privateProxyTestPacketConn) WriteTo(payload []byte, _ net.Addr) (int, error) {
+	return len(payload), nil
+}
+func (*privateProxyTestPacketConn) Close() error                     { return nil }
+func (*privateProxyTestPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (*privateProxyTestPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*privateProxyTestPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*privateProxyTestPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (t *dialResultPrivateProxyTunnel) Close() error {
 	t.mu.Lock()
@@ -368,6 +410,79 @@ func TestNewPrivateProxyRejectsWeakPSK(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected weak PSK validation error")
 	}
+}
+
+func TestPrivateProxyUDPRequiresHTTP3(t *testing.T) {
+	base := PrivateProxyOption{
+		Name: "udp", Server: "proxy.example.com", Port: 443,
+		PSK: "0123456789abcdef0123456789abcdef", NodeID: 1,
+		SessionPool: 1,
+	}
+	v1, err := NewPrivateProxy(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1.SupportUDP() {
+		t.Fatal("V1 unexpectedly advertises UDP")
+	}
+	if _, err := v1.ListenPacketContext(context.Background(), &C.Metadata{}); err == nil {
+		t.Fatal("V1 UDP association unexpectedly succeeded")
+	}
+
+	base.Transport = "http3"
+	v2, err := NewPrivateProxy(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v2.SupportUDP() {
+		t.Fatal("HTTP/3 transport does not advertise UDP")
+	}
+	v2.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		return &scriptedPrivateProxyTunnel{}, nil
+	}
+	metadata := &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 53}
+	packetConn, err := v2.ListenPacketContext(context.Background(), metadata)
+	if err != nil {
+		t.Fatalf("HTTP/3 UDP association: %v", err)
+	}
+	if packetConn == nil {
+		t.Fatal("HTTP/3 UDP association returned nil")
+	}
+	_ = packetConn.Close()
+}
+
+func TestPrivateProxyUDPRetriesControlPlaneFailure(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "udp-retry", Server: "proxy.example.com", Port: 443,
+		PSK: "0123456789abcdef0123456789abcdef", NodeID: 1,
+		Transport: "http3", SessionPool: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	first := &scriptedPrivateProxyTunnel{dialErr: errors.Join(errors.New("UDP control read"), tunnel.ErrControlPlaneFailure)}
+	replacement := &scriptedPrivateProxyTunnel{}
+	dials := 0
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		dials++
+		if dials == 1 {
+			return first, nil
+		}
+		if dials == 2 {
+			return replacement, nil
+		}
+		return nil, errors.New("unexpected extra UDP retry")
+	}
+	metadata := &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 53}
+	packetConn, err := proxy.ListenPacketContext(context.Background(), metadata)
+	if err != nil {
+		t.Fatalf("UDP control-plane retry: %v", err)
+	}
+	if packetConn == nil || dials != 2 || !first.IsClosed() || replacement.IsClosed() {
+		t.Fatalf("retry state: conn=%v dials=%d firstClosed=%v replacementClosed=%v", packetConn, dials, first.IsClosed(), replacement.IsClosed())
+	}
+	_ = packetConn.Close()
 }
 
 func TestNewPrivateProxyValidatesSessionPool(t *testing.T) {
