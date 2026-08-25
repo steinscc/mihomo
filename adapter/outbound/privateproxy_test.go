@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -17,6 +18,7 @@ import (
 )
 
 type fakePrivateProxyTunnel struct {
+	mu      sync.Mutex
 	closed  bool
 	streams int
 }
@@ -26,13 +28,29 @@ func (t *fakePrivateProxyTunnel) DialContext(context.Context, string) (net.Conn,
 }
 
 func (t *fakePrivateProxyTunnel) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.closed = true
 	return nil
 }
 
-func (t *fakePrivateProxyTunnel) IsClosed() bool { return t.closed }
+func (t *fakePrivateProxyTunnel) IsClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
 
-func (t *fakePrivateProxyTunnel) NumStreams() int { return t.streams }
+func (t *fakePrivateProxyTunnel) NumStreams() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.streams
+}
+
+func (t *fakePrivateProxyTunnel) setStreams(streams int) {
+	t.mu.Lock()
+	t.streams = streams
+	t.mu.Unlock()
+}
 
 type recordingDialer struct {
 	mu      sync.Mutex
@@ -94,6 +112,46 @@ func (t *scriptedPrivateProxyTunnel) NumStreams() int {
 	return t.streams
 }
 
+type dialResultPrivateProxyTunnel struct {
+	mu      sync.Mutex
+	closed  bool
+	streams int
+	err     error
+}
+
+func (t *dialResultPrivateProxyTunnel) DialContext(context.Context, string) (net.Conn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.err != nil {
+		return nil, t.err
+	}
+	conn, peer := net.Pipe()
+	_ = peer.Close()
+	return conn, nil
+}
+
+func (t *dialResultPrivateProxyTunnel) Close() error {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *dialResultPrivateProxyTunnel) IsClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+func (t *dialResultPrivateProxyTunnel) NumStreams() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.streams
+}
+
 type privateProxyResolver struct {
 	ip netip.Addr
 }
@@ -144,6 +202,9 @@ func TestNewPrivateProxyIsLazy(t *testing.T) {
 	if proxy.option.SessionPool != defaultPrivateProxySessionPool {
 		t.Fatalf("default session pool: got %d, want %d", proxy.option.SessionPool, defaultPrivateProxySessionPool)
 	}
+	if proxy.option.MaxStreamsPerSession != defaultMaxStreamsPerSession {
+		t.Fatalf("default max streams per session: got %d, want %d", proxy.option.MaxStreamsPerSession, defaultMaxStreamsPerSession)
+	}
 }
 
 func TestPrivateProxySelectsLeastLoadedTunnelWithRoundRobinTies(t *testing.T) {
@@ -158,7 +219,9 @@ func TestPrivateProxySelectsLeastLoadedTunnelWithRoundRobinTies(t *testing.T) {
 	leastLoadedA := &fakePrivateProxyTunnel{streams: 1}
 	leastLoadedB := &fakePrivateProxyTunnel{streams: 1}
 	mostLoaded := &fakePrivateProxyTunnel{streams: 4}
-	proxy.tunnels = []privateProxyTunnel{mostLoaded, leastLoadedA, leastLoadedB}
+	proxy.tunnels = []*privateProxyTunnelState{
+		{tunnel: mostLoaded}, {tunnel: leastLoadedA}, {tunnel: leastLoadedB},
+	}
 
 	for i, want := range []privateProxyTunnel{leastLoadedA, leastLoadedB, leastLoadedA, leastLoadedB} {
 		got := proxy.selectTunnel(true)
@@ -298,10 +361,33 @@ func TestNewPrivateProxyValidatesSessionPool(t *testing.T) {
 	}
 }
 
+func TestNewPrivateProxyValidatesMaxStreamsPerSession(t *testing.T) {
+	for _, size := range []int{-1, maxMaxStreamsPerSession + 1} {
+		_, err := NewPrivateProxy(PrivateProxyOption{
+			Name: "stream-threshold-test", Server: "proxy.example.com",
+			PSK: "0123456789abcdef0123456789abcdef", MaxStreamsPerSession: size,
+		})
+		if err == nil {
+			t.Fatalf("max_streams_per_session=%d should be rejected", size)
+		}
+	}
+
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "stream-threshold-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", MaxStreamsPerSession: maxMaxStreamsPerSession,
+	})
+	if err != nil {
+		t.Fatalf("maximum max_streams_per_session should be accepted: %v", err)
+	}
+	if proxy.option.MaxStreamsPerSession != maxMaxStreamsPerSession {
+		t.Fatalf("max streams per session: got %d, want %d", proxy.option.MaxStreamsPerSession, maxMaxStreamsPerSession)
+	}
+}
+
 func TestPrivateProxyBuildsAndReusesPoolOnDemand(t *testing.T) {
 	proxy, err := NewPrivateProxy(PrivateProxyOption{
-		Name: "pool-test", Server: "proxy.example.com",
-		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2,
+		Name: "pool-test", Server: "proxy.example.com", SessionPool: 2, MaxStreamsPerSession: 1,
+		PSK: "0123456789abcdef0123456789abcdef",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +403,7 @@ func TestPrivateProxyBuildsAndReusesPoolOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxy.tunnels[0].tunnel.(*fakePrivateProxyTunnel).setStreams(1)
 	second, err := proxy.getOrCreateTunnel(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -345,8 +432,8 @@ func TestPrivateProxyBuildsAndReusesPoolOnDemand(t *testing.T) {
 
 func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
 	proxy, err := NewPrivateProxy(PrivateProxyOption{
-		Name: "partial-pool-test", Server: "proxy.example.com",
-		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2,
+		Name: "partial-pool-test", Server: "proxy.example.com", SessionPool: 2, MaxStreamsPerSession: 1,
+		PSK: "0123456789abcdef0123456789abcdef",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -366,6 +453,7 @@ func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first session: %v", err)
 	}
+	proxy.tunnels[0].tunnel.(*fakePrivateProxyTunnel).setStreams(1)
 	fallback, err := proxy.getOrCreateTunnel(context.Background())
 	if err != nil {
 		t.Fatalf("partial pool should remain usable after refill failure: %v", err)
@@ -375,6 +463,280 @@ func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
 	}
 	if dials != 2 {
 		t.Fatalf("dial count: got %d, want 2", dials)
+	}
+}
+
+func TestPrivateProxyReusesUnderThresholdWithoutRefillDial(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "partial-pool-capacity-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	first := &fakePrivateProxyTunnel{}
+	dials := 0
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		dials++
+		if dials > 1 {
+			return nil, errors.New("refill must not be attempted while capacity is available")
+		}
+		return first, nil
+	}
+
+	got, err := proxy.getOrCreateTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("create first session: %v", err)
+	}
+	if got != first {
+		t.Fatalf("first session: got %p, want %p", got, first)
+	}
+	first.setStreams(1)
+	got, err = proxy.getOrCreateTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("reuse under threshold: %v", err)
+	}
+	if got != first {
+		t.Fatalf("under-threshold session: got %p, want %p", got, first)
+	}
+	if dials != 1 {
+		t.Fatalf("dial count: got %d, want 1", dials)
+	}
+}
+
+func TestPrivateProxyExpandsOnlyAfterAllSessionsReachThreshold(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "threshold-expansion-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 3, MaxStreamsPerSession: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	dials := 0
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		dials++
+		return &dialResultPrivateProxyTunnel{}, nil
+	}
+
+	first, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("first reservation: %v", err)
+	}
+	second, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("second reservation: %v", err)
+	}
+	if first.state != second.state {
+		t.Fatal("reservations below the threshold should share the first session")
+	}
+	third, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("threshold expansion reservation: %v", err)
+	}
+	if third.state == first.state {
+		t.Fatal("all capacity on the first session should trigger one new session")
+	}
+	if dials != 2 || len(proxy.tunnels) != 2 {
+		t.Fatalf("pool expansion: dials=%d tunnels=%d, want 2/2", dials, len(proxy.tunnels))
+	}
+	first.release()
+	second.release()
+	third.release()
+}
+
+func TestPrivateProxyUsesLiveSessionWhileAnotherRefillIsInProgress(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "refill-contention-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	first := &dialResultPrivateProxyTunnel{streams: 1}
+	proxy.tunnels = []*privateProxyTunnelState{{tunnel: first}}
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	proxy.dialTunnel = func(ctx context.Context, _ tunnel.ServerEntry, _ string) (privateProxyTunnel, error) {
+		close(dialStarted)
+		select {
+		case <-releaseDial:
+			return &dialResultPrivateProxyTunnel{}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	refill := make(chan *privateProxyTunnelReservation, 1)
+	refillErr := make(chan error, 1)
+	go func() {
+		lease, err := proxy.reserveTunnel(context.Background())
+		refill <- lease
+		refillErr <- err
+	}()
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refill dial did not start")
+	}
+
+	fast := make(chan *privateProxyTunnelReservation, 1)
+	fastErr := make(chan error, 1)
+	go func() {
+		lease, err := proxy.reserveTunnel(context.Background())
+		fast <- lease
+		fastErr <- err
+	}()
+	select {
+	case err := <-fastErr:
+		if err != nil {
+			t.Fatalf("live session reservation during refill: %v", err)
+		}
+		lease := <-fast
+		if lease.tunnel() != first {
+			t.Fatalf("contention fallback selected %p, want %p", lease.tunnel(), first)
+		}
+		lease.release()
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("request waited for a refill despite an existing live session")
+	}
+
+	close(releaseDial)
+	select {
+	case err := <-refillErr:
+		if err != nil {
+			t.Fatalf("refill reservation: %v", err)
+		}
+		(<-refill).release()
+	case <-time.After(time.Second):
+		t.Fatal("refill reservation did not finish")
+	}
+}
+
+func TestPrivateProxyPendingReservationsBalanceConcurrentBurst(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "pending-fairness-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	left := &dialResultPrivateProxyTunnel{}
+	right := &dialResultPrivateProxyTunnel{}
+	proxy.tunnels = []*privateProxyTunnelState{{tunnel: left}, {tunnel: right}}
+
+	const reservations = 64
+	start := make(chan struct{})
+	leases := make(chan *privateProxyTunnelReservation, reservations)
+	errs := make(chan error, reservations)
+	var wg sync.WaitGroup
+	for i := 0; i < reservations; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			lease, err := proxy.reserveTunnel(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			leases <- lease
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(leases)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent reservation: %v", err)
+	}
+
+	counts := map[privateProxyTunnel]int{}
+	collected := make([]*privateProxyTunnelReservation, 0, reservations)
+	for lease := range leases {
+		counts[lease.tunnel()]++
+		collected = append(collected, lease)
+	}
+	if counts[left] < reservations/2-1 || counts[right] < reservations/2-1 {
+		t.Fatalf("pending reservations were not balanced: left=%d right=%d", counts[left], counts[right])
+	}
+	for _, lease := range collected {
+		lease.release()
+	}
+	if got := proxy.tunnels[0].pending.Load() + proxy.tunnels[1].pending.Load(); got != 0 {
+		t.Fatalf("pending reservations leaked: %d", got)
+	}
+}
+
+func TestPrivateProxyPoolCapSoftDegradesWhenThresholdIsFull(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "pool-cap-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	left := &dialResultPrivateProxyTunnel{streams: 1}
+	right := &dialResultPrivateProxyTunnel{streams: 2}
+	proxy.tunnels = []*privateProxyTunnelState{{tunnel: left}, {tunnel: right}}
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		return nil, errors.New("pool is already at its maximum")
+	}
+
+	lease, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("full pool should soft-degrade: %v", err)
+	}
+	if lease.tunnel() != left {
+		t.Fatalf("full pool selected %p, want least-loaded %p", lease.tunnel(), left)
+	}
+	lease.release()
+}
+
+func TestPrivateProxyDialReleasesPendingReservationOnSuccessAndFailure(t *testing.T) {
+	metadata := &C.Metadata{Host: "example.com", DstPort: 443}
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "failure", err: errors.New("upstream unavailable")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			proxy, err := NewPrivateProxy(PrivateProxyOption{
+				Name: "reservation-release-test", Server: "proxy.example.com", SessionPool: 1,
+				PSK: "0123456789abcdef0123456789abcdef",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fake := &dialResultPrivateProxyTunnel{err: test.err}
+			proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+				return fake, nil
+			}
+			conn, dialErr := proxy.DialContext(context.Background(), metadata)
+			if test.err == nil {
+				if dialErr != nil || conn == nil {
+					t.Fatalf("success: conn=%v err=%v", conn, dialErr)
+				}
+				_ = conn.Close()
+			} else if dialErr == nil {
+				t.Fatal("expected dial failure")
+			}
+			if got := proxy.tunnels[0].pending.Load(); got != 0 {
+				t.Fatalf("pending reservation after %s: got %d, want 0", test.name, got)
+			}
+			_ = proxy.Close()
+		})
 	}
 }
 

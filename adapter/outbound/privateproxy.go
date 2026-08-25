@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,9 +33,18 @@ type PrivateProxyOption struct {
 	// builds that register the corresponding transport adapter.
 	Transport string `proxy:"transport,omitempty"`
 	// SessionPool is the number of independent TLS/yamux sessions opened on
-	// demand. More than one session limits cross-stream head-of-line blocking
-	// on lossy long-distance TCP paths.
+	// demand. It is a maximum connection count; sessions are added only when
+	// every live session reaches MaxStreamsPerSession.
 	SessionPool int `proxy:"session_pool,omitempty"`
+	// MaxStreamsPerSession is the soft admission threshold used to decide when
+	// another underlying session should be opened. Once the pool is full, the
+	// least-loaded session remains usable beyond this threshold.
+	MaxStreamsPerSession int `proxy:"max_streams_per_session,omitempty"`
+}
+
+type privateProxyTunnelState struct {
+	tunnel  privateProxyTunnel
+	pending atomic.Int64
 }
 
 type PrivateProxy struct {
@@ -44,7 +54,7 @@ type PrivateProxy struct {
 
 	mu         sync.RWMutex
 	dialMu     sync.Mutex
-	tunnels    []privateProxyTunnel
+	tunnels    []*privateProxyTunnelState
 	dialTunnel privateProxyTunnelDialer
 	next       atomic.Uint64
 	closed     bool
@@ -57,11 +67,32 @@ type privateProxyTunnel interface {
 	NumStreams() int
 }
 
+type privateProxyTunnelReservation struct {
+	state *privateProxyTunnelState
+	once  sync.Once
+}
+
+func (r *privateProxyTunnelReservation) tunnel() privateProxyTunnel {
+	if r == nil || r.state == nil {
+		return nil
+	}
+	return r.state.tunnel
+}
+
+func (r *privateProxyTunnelReservation) release() {
+	if r == nil || r.state == nil {
+		return
+	}
+	r.once.Do(func() { r.state.pending.Add(-1) })
+}
+
 type privateProxyTunnelDialer func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error)
 
 const (
-	defaultPrivateProxySessionPool = 4
-	maxPrivateProxySessionPool     = 4
+	defaultPrivateProxySessionPool = 8
+	maxPrivateProxySessionPool     = 16
+	defaultMaxStreamsPerSession    = 8
+	maxMaxStreamsPerSession        = 64
 )
 
 func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
@@ -92,6 +123,12 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 	}
 	if option.SessionPool < 1 || option.SessionPool > maxPrivateProxySessionPool {
 		return nil, fmt.Errorf("privateproxy: session_pool must be between 1 and %d", maxPrivateProxySessionPool)
+	}
+	if option.MaxStreamsPerSession == 0 {
+		option.MaxStreamsPerSession = defaultMaxStreamsPerSession
+	}
+	if option.MaxStreamsPerSession < 1 || option.MaxStreamsPerSession > maxMaxStreamsPerSession {
+		return nil, fmt.Errorf("privateproxy: max_streams_per_session must be between 1 and %d", maxMaxStreamsPerSession)
 	}
 
 	addr := net.JoinHostPort(option.Server, fmt.Sprintf("%d", option.Port))
@@ -126,19 +163,30 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 }
 
 func (p *PrivateProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	t, err := p.getOrCreateTunnel(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reservation, err := p.reserveTunnel(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("privateproxy tunnel: %w", err)
+	}
+	t := reservation.tunnel()
+	defer reservation.release()
+	if metadata == nil || t == nil {
+		return nil, errors.New("privateproxy: tunnel or metadata is nil")
 	}
 
 	dest := metadata.RemoteAddress()
 	conn, err := t.DialContext(ctx, dest)
+	reservation.release()
 	if err != nil && shouldRetryPrivateProxyDial(t, err) && ctx.Err() == nil {
 		// A dead pooled session should not poison subsequent streams. Remove it
 		// and retry once on another (or newly created) on-demand session.
 		p.removeTunnel(t)
-		if replacement, replacementErr := p.getOrCreateTunnel(ctx); replacementErr == nil {
+		if replacementReservation, replacementErr := p.reserveTunnel(ctx); replacementErr == nil {
+			replacement := replacementReservation.tunnel()
 			conn, err = replacement.DialContext(ctx, dest)
+			replacementReservation.release()
 			if err != nil && shouldRetryPrivateProxyDial(replacement, err) {
 				// Do not leave a replacement that failed during the control
 				// plane handshake in the pool. This is cleanup only; the
@@ -178,8 +226,8 @@ func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
 	}
 
 	live := 0
-	for _, t := range p.tunnels {
-		if t == nil || t.IsClosed() {
+	for _, state := range p.tunnels {
+		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
 			continue
 		}
 		live++
@@ -191,18 +239,18 @@ func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
 	minStreams := int(^uint(0) >> 1)
 	var leastLoaded [maxPrivateProxySessionPool]privateProxyTunnel
 	tieCount := 0
-	for _, t := range p.tunnels {
-		if t == nil || t.IsClosed() {
+	for _, state := range p.tunnels {
+		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
 			continue
 		}
-		streams := t.NumStreams()
+		streams := state.tunnel.NumStreams() + int(state.pending.Load())
 		if streams < minStreams {
 			minStreams = streams
 			tieCount = 1
-			leastLoaded[0] = t
+			leastLoaded[0] = state.tunnel
 		} else if streams == minStreams {
 			tieCount++
-			leastLoaded[tieCount-1] = t
+			leastLoaded[tieCount-1] = state.tunnel
 		}
 	}
 	if tieCount == 0 {
@@ -217,53 +265,182 @@ func (p *PrivateProxy) selectTunnel(requireFullPool bool) privateProxyTunnel {
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {
-	if current := p.readyTunnel(); current != nil {
-		return current, nil
-	}
-
-	p.dialMu.Lock()
-	defer p.dialMu.Unlock()
-	if current := p.readyTunnel(); current != nil {
-		return current, nil
-	}
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, net.ErrClosed
-	}
-	live := p.tunnels[:0]
-	for _, current := range p.tunnels {
-		if current != nil && !current.IsClosed() {
-			live = append(live, current)
-		}
-	}
-	p.tunnels = live
-	poolIndex := len(p.tunnels) + 1
-	p.mu.Unlock()
-
-	entry := p.serverEntry()
-	log.Infoln("privateproxy: connecting to %s on demand (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
-	t, err := p.dialTunnel(ctx, entry, p.option.PSK)
+	reservation, err := p.reserveTunnel(ctx)
 	if err != nil {
-		if ctx.Err() == nil {
-			if fallback := p.liveTunnel(); fallback != nil {
-				log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session: %v", p.addr, err)
-				return fallback, nil
+		return nil, err
+	}
+	t := reservation.tunnel()
+	reservation.release()
+	return t, nil
+}
+
+// reserveTunnel selects a live session and reserves one pending stream. A new
+// session is opened synchronously only when every live session has reached the
+// configured threshold and the pool still has room. Existing capacity always
+// wins over a refill dial, and an existing live session is returned if a refill
+// fails.
+func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelReservation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		p.mu.Lock()
+		p.pruneClosedLocked()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		best, live, bestLoad := p.bestSessionLocked()
+		if best != nil && (bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool) {
+			best.pending.Add(1)
+			p.mu.Unlock()
+			return &privateProxyTunnelReservation{state: best}, nil
+		}
+		if live >= p.option.SessionPool {
+			// Defensive fallback for a zero/invalid threshold; normal validation
+			// makes this branch equivalent to the soft-degrade condition above.
+			if best != nil {
+				best.pending.Add(1)
+				p.mu.Unlock()
+				return &privateProxyTunnelReservation{state: best}, nil
 			}
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		p.mu.Unlock()
+
+		// Serialize pool growth, but do not make concurrent requests wait behind
+		// an in-progress refill when an existing live session can still serve
+		// them. The caller that wins the lock performs the one synchronous dial;
+		// other callers reserve the least-loaded live session immediately.
+		if !p.dialMu.TryLock() {
+			p.mu.Lock()
+			p.pruneClosedLocked()
+			best, _, _ = p.bestSessionLocked()
+			if best != nil && !p.closed {
+				best.pending.Add(1)
+				p.mu.Unlock()
+				return &privateProxyTunnelReservation{state: best}, nil
+			}
+			closed := p.closed
+			p.mu.Unlock()
+			if closed {
+				return nil, net.ErrClosed
+			}
+			p.dialMu.Lock()
+		}
+		// Re-check capacity after acquiring the lock: another caller may have
+		// opened a session while this caller waited.
+		p.mu.Lock()
+		p.pruneClosedLocked()
+		if p.closed {
+			p.mu.Unlock()
+			p.dialMu.Unlock()
+			return nil, net.ErrClosed
+		}
+		best, live, bestLoad = p.bestSessionLocked()
+		if best != nil && (bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool) {
+			best.pending.Add(1)
+			p.mu.Unlock()
+			p.dialMu.Unlock()
+			return &privateProxyTunnelReservation{state: best}, nil
+		}
+		if live >= p.option.SessionPool {
+			if best != nil {
+				best.pending.Add(1)
+				p.mu.Unlock()
+				p.dialMu.Unlock()
+				return &privateProxyTunnelReservation{state: best}, nil
+			}
+			p.mu.Unlock()
+			p.dialMu.Unlock()
+			return nil, net.ErrClosed
+		}
+		poolIndex := live + 1
+		p.mu.Unlock()
+
+		entry := p.serverEntry()
+		log.Infoln("privateproxy: connecting to %s on demand (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
+		t, err := p.dialTunnel(ctx, entry, p.option.PSK)
+		if err == nil && t == nil {
+			err = errors.New("privateproxy: tunnel dialer returned a nil session")
+		}
+		if err == nil {
+			p.mu.Lock()
+			closed := p.closed
+			if !closed {
+				p.tunnels = append(p.tunnels, &privateProxyTunnelState{tunnel: t})
+			}
+			p.mu.Unlock()
+			if closed {
+				p.dialMu.Unlock()
+				_ = t.Close()
+				return nil, net.ErrClosed
+			}
+			log.Infoln("privateproxy: tunnel to %s ready (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
+			p.dialMu.Unlock()
+			// Loop once so the newly created session receives the reservation.
+			continue
+		}
+		p.dialMu.Unlock()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// A failed refill must not make an already usable partial pool
+		// unavailable. Reserve the least-loaded live session immediately.
+		p.mu.Lock()
+		p.pruneClosedLocked()
+		best, _, _ = p.bestSessionLocked()
+		if best != nil && !p.closed {
+			best.pending.Add(1)
+			p.mu.Unlock()
+			log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session: %v", p.addr, err)
+			return &privateProxyTunnelReservation{state: best}, nil
+		}
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			return nil, net.ErrClosed
 		}
 		return nil, err
 	}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		_ = t.Close()
-		return nil, net.ErrClosed
+}
+
+func (p *PrivateProxy) bestSessionLocked() (best *privateProxyTunnelState, live, bestLoad int) {
+	bestLoad = int(^uint(0) >> 1)
+	for _, state := range p.tunnels {
+		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
+			continue
+		}
+		live++
+		load := state.tunnel.NumStreams() + int(state.pending.Load())
+		if best == nil || load < bestLoad {
+			best = state
+			bestLoad = load
+		}
 	}
-	p.tunnels = append(p.tunnels, t)
-	p.mu.Unlock()
-	log.Infoln("privateproxy: tunnel to %s ready (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
-	return t, nil
+	return best, live, bestLoad
+}
+
+func (p *PrivateProxy) pruneClosedLocked() {
+	if len(p.tunnels) == 0 {
+		return
+	}
+	live := p.tunnels[:0]
+	for _, state := range p.tunnels {
+		if state != nil && state.tunnel != nil && !state.tunnel.IsClosed() {
+			live = append(live, state)
+		}
+	}
+	p.tunnels = live
 }
 
 func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
@@ -281,14 +458,33 @@ func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
 func (p *PrivateProxy) removeTunnel(target privateProxyTunnel) {
 	p.mu.Lock()
 	live := p.tunnels[:0]
-	for _, current := range p.tunnels {
-		if current != target {
-			live = append(live, current)
+	var removed []privateProxyTunnel
+	for _, state := range p.tunnels {
+		if state == nil || !samePrivateProxyTunnel(state.tunnel, target) {
+			live = append(live, state)
+		} else if state.tunnel != nil {
+			removed = append(removed, state.tunnel)
 		}
 	}
 	p.tunnels = live
 	p.mu.Unlock()
-	_ = target.Close()
+	if target != nil {
+		removed = append(removed, target)
+	}
+	for _, current := range removed {
+		_ = current.Close()
+	}
+}
+
+func samePrivateProxyTunnel(a, b privateProxyTunnel) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb || !ta.Comparable() {
+		return false
+	}
+	return a == b
 }
 
 func (p *PrivateProxy) SupportUDP() bool { return false }
@@ -296,8 +492,8 @@ func (p *PrivateProxy) SupportUDP() bool { return false }
 func (p *PrivateProxy) Alive() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	for _, current := range p.tunnels {
-		if current != nil && !current.IsClosed() {
+	for _, state := range p.tunnels {
+		if state != nil && state.tunnel != nil && !state.tunnel.IsClosed() {
 			return true
 		}
 	}
@@ -313,9 +509,9 @@ func (p *PrivateProxy) Close() error {
 	p.tunnels = nil
 	p.mu.Unlock()
 	var firstErr error
-	for _, current := range tunnels {
-		if current != nil {
-			if err := current.Close(); err != nil && firstErr == nil {
+	for _, state := range tunnels {
+		if state != nil && state.tunnel != nil {
+			if err := state.tunnel.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
