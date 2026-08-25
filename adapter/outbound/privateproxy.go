@@ -2,12 +2,15 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -93,14 +96,30 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 	addr := net.JoinHostPort(option.Server, fmt.Sprintf("%d", option.Port))
 	p := &PrivateProxy{
 		Base: NewBase(BaseOption{
-			Name: option.Name, Addr: addr,
-			Type: C.Compatible, UDP: false,
+			Name:         option.Name,
+			Addr:         addr,
+			Type:         C.Compatible,
+			ProviderName: option.ProviderName,
+			UDP:          false,
+			TFO:          option.TFO,
+			MPTCP:        option.MPTCP,
+			Interface:    option.Interface,
+			RoutingMark:  option.RoutingMark,
+			Prefer:       option.IPVersion,
 		}),
 		option: option, addr: addr,
 		dialTunnel: func(ctx context.Context, entry tunnel.ServerEntry, psk string) (privateProxyTunnel, error) {
 			return tunnel.DialTunnelContext(ctx, entry, psk)
 		},
 	}
+
+	// The control-plane connection is an outbound connection too. Build it
+	// through Mihomo's configured dialer so interface binding, routing marks,
+	// IP-version preference, TFO/MPTCP, proxy chaining, and proxy DNS all apply
+	// before the PrivateProxy TLS handshake starts.
+	dialOptions := append([]dialer.Option(nil), p.DialOptions()...)
+	dialOptions = append(dialOptions, dialer.WithResolver(resolver.ProxyServerHostResolver))
+	p.dialer = option.NewDialer(dialOptions)
 
 	return p, nil
 }
@@ -113,12 +132,18 @@ func (p *PrivateProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C
 
 	dest := metadata.RemoteAddress()
 	conn, err := t.DialContext(ctx, dest)
-	if err != nil && t.IsClosed() && ctx.Err() == nil {
+	if err != nil && shouldRetryPrivateProxyDial(t, err) && ctx.Err() == nil {
 		// A dead pooled session should not poison subsequent streams. Remove it
 		// and retry once on another (or newly created) on-demand session.
 		p.removeTunnel(t)
 		if replacement, replacementErr := p.getOrCreateTunnel(ctx); replacementErr == nil {
 			conn, err = replacement.DialContext(ctx, dest)
+			if err != nil && shouldRetryPrivateProxyDial(replacement, err) {
+				// Do not leave a replacement that failed during the control
+				// plane handshake in the pool. This is cleanup only; the
+				// request still gets at most one retry.
+				p.removeTunnel(replacement)
+			}
 		}
 	}
 	if err != nil {
@@ -126,6 +151,10 @@ func (p *PrivateProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C
 		return nil, fmt.Errorf("dial %s: %w", dest, err)
 	}
 	return NewConn(conn, p), nil
+}
+
+func shouldRetryPrivateProxyDial(t privateProxyTunnel, err error) bool {
+	return errors.Is(err, tunnel.ErrControlPlaneFailure) || (t != nil && t.IsClosed())
 }
 
 func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
@@ -194,11 +223,7 @@ func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunne
 	poolIndex := len(p.tunnels) + 1
 	p.mu.Unlock()
 
-	entry := tunnel.ServerEntry{
-		Name: p.option.Name, Address: p.addr, SNI: p.option.SNI,
-		NodeID: uint32(p.option.NodeID), Weight: 10,
-		CAFile: p.option.CAFile, SPKIPins: p.option.SPKIPins, Transport: p.option.Transport,
-	}
+	entry := p.serverEntry()
 	log.Infoln("privateproxy: connecting to %s on demand (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
 	t, err := p.dialTunnel(ctx, entry, p.option.PSK)
 	if err != nil {
@@ -220,6 +245,18 @@ func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunne
 	p.mu.Unlock()
 	log.Infoln("privateproxy: tunnel to %s ready (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
 	return t, nil
+}
+
+func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
+	entry := tunnel.ServerEntry{
+		Name: p.option.Name, Address: p.addr, SNI: p.option.SNI,
+		NodeID: uint32(p.option.NodeID), Weight: 10,
+		CAFile: p.option.CAFile, SPKIPins: p.option.SPKIPins, Transport: p.option.Transport,
+	}
+	if p.dialer != nil {
+		entry.RawDialContext = p.dialer.DialContext
+	}
+	return entry
 }
 
 func (p *PrivateProxy) removeTunnel(target privateProxyTunnel) {

@@ -4,7 +4,14 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
+	"strconv"
+	"sync"
 	"testing"
+
+	"github.com/metacubex/mihomo/component/resolver"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/miekg/dns"
 
 	"private_proxy/pkg/tunnel"
 )
@@ -23,6 +30,88 @@ func (t *fakePrivateProxyTunnel) Close() error {
 }
 
 func (t *fakePrivateProxyTunnel) IsClosed() bool { return t.closed }
+
+type recordingDialer struct {
+	mu      sync.Mutex
+	network string
+	address string
+}
+
+func (d *recordingDialer) DialContext(_ context.Context, network, address string) (net.Conn, error) {
+	d.mu.Lock()
+	d.network = network
+	d.address = address
+	d.mu.Unlock()
+	conn, peer := net.Pipe()
+	_ = peer.Close()
+	return conn, nil
+}
+
+func (d *recordingDialer) ListenPacket(context.Context, string, string, netip.AddrPort) (net.PacketConn, error) {
+	return nil, errors.New("packet dialing is not used by privateproxy")
+}
+
+type scriptedPrivateProxyTunnel struct {
+	mu      sync.Mutex
+	closed  bool
+	dialErr error
+}
+
+func (t *scriptedPrivateProxyTunnel) DialContext(context.Context, string) (net.Conn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.dialErr != nil {
+		return nil, t.dialErr
+	}
+	conn, peer := net.Pipe()
+	_ = peer.Close()
+	return conn, nil
+}
+
+func (t *scriptedPrivateProxyTunnel) Close() error {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *scriptedPrivateProxyTunnel) IsClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+type privateProxyResolver struct {
+	ip netip.Addr
+}
+
+func (r privateProxyResolver) LookupIP(context.Context, string) ([]netip.Addr, error) {
+	return []netip.Addr{r.ip}, nil
+}
+
+func (r privateProxyResolver) LookupIPv4(context.Context, string) ([]netip.Addr, error) {
+	return []netip.Addr{r.ip}, nil
+}
+
+func (r privateProxyResolver) LookupIPv6(context.Context, string) ([]netip.Addr, error) {
+	return nil, resolver.ErrIPv6Disabled
+}
+
+func (privateProxyResolver) ResolveECH(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (privateProxyResolver) ExchangeContext(context.Context, *dns.Msg) (*dns.Msg, error) {
+	return nil, errors.New("DNS exchange is not used by privateproxy test resolver")
+}
+
+func (privateProxyResolver) Invalid() bool { return true }
+
+func (privateProxyResolver) ClearCache()      {}
+func (privateProxyResolver) ResetConnection() {}
 
 func TestNewPrivateProxyIsLazy(t *testing.T) {
 	proxy, err := NewPrivateProxy(PrivateProxyOption{
@@ -44,6 +133,102 @@ func TestNewPrivateProxyIsLazy(t *testing.T) {
 	}
 	if proxy.option.SessionPool != defaultPrivateProxySessionPool {
 		t.Fatalf("default session pool: got %d, want %d", proxy.option.SessionPool, defaultPrivateProxySessionPool)
+	}
+}
+
+func TestPrivateProxyPropagatesBasicOptionsAndInjectsDialer(t *testing.T) {
+	recording := &recordingDialer{}
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "basic-options", Server: "proxy.example.com", Port: 443,
+		PSK: "0123456789abcdef0123456789abcdef", NodeID: 7,
+		BasicOption: BasicOption{
+			TFO:          true,
+			MPTCP:        true,
+			Interface:    "Ethernet 7",
+			RoutingMark:  1234,
+			IPVersion:    C.IPv4Only,
+			ProviderName: "provider-a",
+			DialerForAPI: recording,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info := proxy.ProxyInfo()
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{name: "tfo", got: info.TFO, want: true},
+		{name: "mptcp", got: info.MPTCP, want: true},
+		{name: "interface", got: info.Interface, want: "Ethernet 7"},
+		{name: "routing mark", got: info.RoutingMark, want: 1234},
+		{name: "provider", got: info.ProviderName, want: "provider-a"},
+	}
+	for _, check := range checks {
+		if check.got != check.want {
+			t.Errorf("%s: got %v, want %v", check.name, check.got, check.want)
+		}
+	}
+
+	entry := proxy.serverEntry()
+	if entry.RawDialContext == nil {
+		t.Fatal("privateproxy server entry must inject the Mihomo raw dialer")
+	}
+	conn, err := entry.RawDialContext(context.Background(), "tcp4", "proxy.example.com:443")
+	if err != nil {
+		t.Fatalf("injected raw dialer: %v", err)
+	}
+	_ = conn.Close()
+	recording.mu.Lock()
+	gotNetwork, gotAddress := recording.network, recording.address
+	recording.mu.Unlock()
+	if gotNetwork != "tcp4" || gotAddress != "proxy.example.com:443" {
+		t.Fatalf("raw dial arguments: got %s %s", gotNetwork, gotAddress)
+	}
+}
+
+func TestPrivateProxyUsesProxyServerResolverForRawDial(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	oldResolver := resolver.ProxyServerHostResolver
+	resolver.ProxyServerHostResolver = privateProxyResolver{ip: netip.MustParseAddr("127.0.0.1")}
+	defer func() { resolver.ProxyServerHostResolver = oldResolver }()
+
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "resolver-injection", Server: "proxy.example.com", Port: 443,
+		PSK: "0123456789abcdef0123456789abcdef", NodeID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry := proxy.serverEntry()
+	if entry.RawDialContext == nil {
+		t.Fatal("privateproxy server entry must inject a raw dialer")
+	}
+	acceptErr := make(chan error, 1)
+	go func() {
+		acceptedConn, err := listener.Accept()
+		if acceptedConn != nil {
+			_ = acceptedConn.Close()
+		}
+		acceptErr <- err
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	conn, err := entry.RawDialContext(context.Background(), "tcp", "proxy.example.com:"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("raw dial through proxy resolver: %v", err)
+	}
+	_ = conn.Close()
+	if err := <-acceptErr; err != nil {
+		t.Fatalf("accept raw dial: %v", err)
 	}
 }
 
@@ -158,5 +343,80 @@ func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
 	}
 	if dials != 2 {
 		t.Fatalf("dial count: got %d, want 2", dials)
+	}
+}
+
+func TestPrivateProxyEvictsControlPlaneFailuresButNotConnectErrors(t *testing.T) {
+	tests := []struct {
+		name                 string
+		firstErr             error
+		wantRetry            bool
+		wantFirstClosed      bool
+		wantReplacementAlive bool
+	}{
+		{
+			name:                 "control plane failure retries once",
+			firstErr:             errors.Join(errors.New("read header"), tunnel.ErrControlPlaneFailure),
+			wantRetry:            true,
+			wantFirstClosed:      true,
+			wantReplacementAlive: true,
+		},
+		{
+			name:            "upstream connect error does not retry",
+			firstErr:        errors.New("CONNECT rejected: connection refused"),
+			wantRetry:       false,
+			wantFirstClosed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, err := NewPrivateProxy(PrivateProxyOption{
+				Name: "retry-test", Server: "proxy.example.com",
+				PSK: "0123456789abcdef0123456789abcdef", SessionPool: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proxy.Close()
+
+			first := &scriptedPrivateProxyTunnel{dialErr: tt.firstErr}
+			replacement := &scriptedPrivateProxyTunnel{}
+			dials := 0
+			proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+				dials++
+				switch dials {
+				case 1:
+					return first, nil
+				case 2:
+					return replacement, nil
+				default:
+					return nil, errors.New("unexpected second retry")
+				}
+			}
+
+			metadata := &C.Metadata{Host: "example.com", DstPort: 443}
+			conn, dialErr := proxy.DialContext(context.Background(), metadata)
+			if tt.wantRetry {
+				if dialErr != nil {
+					t.Fatalf("control-plane failure should retry: %v", dialErr)
+				}
+				if conn == nil {
+					t.Fatal("retry should return a connection")
+				}
+				_ = conn.Close()
+			} else if dialErr == nil {
+				t.Fatal("ordinary CONNECT_ERROR must be returned without retry")
+			}
+			if (dials == 2) != tt.wantRetry {
+				t.Fatalf("dial count: got %d, want retry=%v", dials, tt.wantRetry)
+			}
+			if first.IsClosed() != tt.wantFirstClosed {
+				t.Fatalf("first tunnel closed: got %v, want %v", first.IsClosed(), tt.wantFirstClosed)
+			}
+			if tt.wantReplacementAlive && replacement.IsClosed() {
+				t.Fatal("healthy replacement must remain in the pool")
+			}
+		})
 	}
 }
