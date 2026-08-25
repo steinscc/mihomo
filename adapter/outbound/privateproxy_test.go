@@ -472,6 +472,20 @@ func TestPrivateProxyUsesHealthyPartialPoolWhenRefillFails(t *testing.T) {
 	if dials != 2 {
 		t.Fatalf("dial count: got %d, want 2", dials)
 	}
+	cooldownFallback, err := proxy.getOrCreateTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("cooldown fallback: %v", err)
+	}
+	if cooldownFallback != healthy || dials != 2 {
+		t.Fatalf("cooldown retried refill: fallback=%p healthy=%p dials=%d", cooldownFallback, healthy, dials)
+	}
+	proxy.refillAt.Store(time.Now().Add(-time.Second).UnixNano())
+	if _, err := proxy.getOrCreateTunnel(context.Background()); err != nil {
+		t.Fatalf("expired cooldown fallback: %v", err)
+	}
+	if dials != 3 {
+		t.Fatalf("expired cooldown did not retry refill: dials=%d, want 3", dials)
+	}
 }
 
 func TestPrivateProxyReusesUnderThresholdWithoutRefillDial(t *testing.T) {
@@ -556,17 +570,17 @@ func TestPrivateProxyExpandsOnlyAfterAllSessionsReachThreshold(t *testing.T) {
 	third.release()
 }
 
-func TestPrivateProxyUsesLiveSessionWhileAnotherRefillIsInProgress(t *testing.T) {
+func TestPrivateProxyBackpressuresWhenOnlyLiveSessionIsAtThreshold(t *testing.T) {
 	proxy, err := NewPrivateProxy(PrivateProxyOption{
 		Name: "refill-contention-test", Server: "proxy.example.com",
-		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 1,
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 2, MaxStreamsPerSession: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer proxy.Close()
 
-	first := &dialResultPrivateProxyTunnel{streams: 1}
+	first := &dialResultPrivateProxyTunnel{streams: 2}
 	proxy.tunnels = []*privateProxyTunnelState{{tunnel: first}}
 	dialStarted := make(chan struct{})
 	releaseDial := make(chan struct{})
@@ -602,16 +616,15 @@ func TestPrivateProxyUsesLiveSessionWhileAnotherRefillIsInProgress(t *testing.T)
 	}()
 	select {
 	case err := <-fastErr:
-		if err != nil {
-			t.Fatalf("live session reservation during refill: %v", err)
-		}
 		lease := <-fast
-		if lease.tunnel() != first {
-			t.Fatalf("contention fallback selected %p, want %p", lease.tunnel(), first)
+		if lease != nil {
+			lease.release()
 		}
-		lease.release()
+		t.Fatalf("threshold-full request bypassed the shared refill: %v", err)
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("request waited for a refill despite an existing live session")
+		// Expected: the existing session is at its threshold, so the second
+		// request waits for the one in-progress expansion instead of adding more
+		// load to the stalled TCP writer.
 	}
 
 	close(releaseDial)
@@ -623,6 +636,16 @@ func TestPrivateProxyUsesLiveSessionWhileAnotherRefillIsInProgress(t *testing.T)
 		(<-refill).release()
 	case <-time.After(time.Second):
 		t.Fatal("refill reservation did not finish")
+	}
+	select {
+	case err := <-fastErr:
+		if err != nil {
+			t.Fatalf("reservation after shared refill: %v", err)
+		}
+		lease := <-fast
+		lease.release()
+	case <-time.After(time.Second):
+		t.Fatal("waiting reservation did not resume after refill")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -56,6 +57,8 @@ type PrivateProxy struct {
 	dialMu     sync.Mutex
 	tunnels    []*privateProxyTunnelState
 	dialTunnel privateProxyTunnelDialer
+	refillFail atomic.Uint32
+	refillAt   atomic.Int64
 	closed     bool
 }
 
@@ -92,6 +95,8 @@ const (
 	maxPrivateProxySessionPool     = 16
 	defaultMaxStreamsPerSession    = 8
 	maxMaxStreamsPerSession        = 64
+	privateProxyRefillBaseDelay    = 500 * time.Millisecond
+	privateProxyRefillMaxDelay     = 30 * time.Second
 )
 
 func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
@@ -260,17 +265,23 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			p.mu.Unlock()
 			return nil, net.ErrClosed
 		}
+		if best != nil && p.refillCoolingDown() {
+			best.pending.Add(1)
+			p.mu.Unlock()
+			return &privateProxyTunnelReservation{state: best}, nil
+		}
 		p.mu.Unlock()
 
-		// Serialize pool growth, but do not make concurrent requests wait behind
-		// an in-progress refill when an existing live session can still serve
-		// them. The caller that wins the lock performs the one synchronous dial;
-		// other callers reserve the least-loaded live session immediately.
+		// Serialize pool growth. Requests can bypass an in-progress refill only
+		// when a live session is below the admission threshold. If all sessions
+		// are full, waiting for the one shared refill provides backpressure instead
+		// of overloading the same TCP writer while a replacement is being created.
 		if !p.dialMu.TryLock() {
 			p.mu.Lock()
 			p.pruneClosedLocked()
-			best, _, _ = p.bestSessionLocked()
-			if best != nil && !p.closed {
+			best, live, bestLoad = p.bestSessionLocked()
+			if best != nil && !p.closed &&
+				(bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool || p.refillCoolingDown()) {
 				best.pending.Add(1)
 				p.mu.Unlock()
 				return &privateProxyTunnelReservation{state: best}, nil
@@ -309,6 +320,12 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			p.dialMu.Unlock()
 			return nil, net.ErrClosed
 		}
+		if best != nil && p.refillCoolingDown() {
+			best.pending.Add(1)
+			p.mu.Unlock()
+			p.dialMu.Unlock()
+			return &privateProxyTunnelReservation{state: best}, nil
+		}
 		poolIndex := live + 1
 		p.mu.Unlock()
 
@@ -319,6 +336,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			err = errors.New("privateproxy: tunnel dialer returned a nil session")
 		}
 		if err == nil {
+			p.resetRefillBackoff()
 			p.mu.Lock()
 			closed := p.closed
 			if !closed {
@@ -335,6 +353,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			// Loop once so the newly created session receives the reservation.
 			continue
 		}
+		backoff := p.noteRefillFailure()
 		p.dialMu.Unlock()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -347,7 +366,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 		if best != nil && !p.closed {
 			best.pending.Add(1)
 			p.mu.Unlock()
-			log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session: %v", p.addr, err)
+			log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session for %s: %v", p.addr, backoff, err)
 			return &privateProxyTunnelReservation{state: best}, nil
 		}
 		closed := p.closed
@@ -386,6 +405,29 @@ func (p *PrivateProxy) pruneClosedLocked() {
 		}
 	}
 	p.tunnels = live
+}
+
+func (p *PrivateProxy) refillCoolingDown() bool {
+	return p.refillAt.Load() > time.Now().UnixNano()
+}
+
+func (p *PrivateProxy) noteRefillFailure() time.Duration {
+	failures := p.refillFail.Add(1)
+	shift := failures - 1
+	if shift > 6 {
+		shift = 6
+	}
+	delay := privateProxyRefillBaseDelay * time.Duration(uint64(1)<<shift)
+	if delay > privateProxyRefillMaxDelay {
+		delay = privateProxyRefillMaxDelay
+	}
+	p.refillAt.Store(time.Now().Add(delay).UnixNano())
+	return delay
+}
+
+func (p *PrivateProxy) resetRefillBackoff() {
+	p.refillFail.Store(0)
+	p.refillAt.Store(0)
 }
 
 func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
