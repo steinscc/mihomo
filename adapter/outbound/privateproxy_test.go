@@ -2,10 +2,15 @@ package outbound
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/netip"
+	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -261,6 +266,226 @@ func TestNewPrivateProxyIsLazy(t *testing.T) {
 	if proxy.option.MaxStreamsPerSession != defaultMaxStreamsPerSession {
 		t.Fatalf("default max streams per session: got %d, want %d", proxy.option.MaxStreamsPerSession, defaultMaxStreamsPerSession)
 	}
+}
+
+func TestPrivateProxyMarshalJSONPoolMetrics(t *testing.T) {
+	tests := []struct {
+		name          string
+		transport     string
+		wantTransport string
+		wantLive      int
+		wantRetired   int
+		wantActive    int64
+		wantPending   int64
+	}{
+		{
+			name:          "empty transport and live retired closed sessions",
+			wantTransport: "tls-yamux",
+			wantLive:      1,
+			wantRetired:   1,
+			wantActive:    7,
+			wantPending:   10,
+		},
+		{
+			name:          "http3 transport",
+			transport:     " HTTP3 ",
+			wantTransport: "http3",
+			wantLive:      1,
+			wantRetired:   1,
+			wantActive:    7,
+			wantPending:   10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, err := NewPrivateProxy(PrivateProxyOption{
+				Name: "json-metrics-test", Server: "proxy.example.com",
+				PSK: "0123456789abcdef0123456789abcdef", Transport: tt.transport,
+				SessionPool: 3, MaxStreamsPerSession: 12,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			live := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}}
+			live.active.Store(2)
+			live.pending.Store(3)
+			retired := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}, retired: true}
+			retired.active.Store(5)
+			retired.pending.Store(7)
+			closed := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}}
+			closed.active.Store(11)
+			closed.pending.Store(13)
+			if err := closed.tunnel.Close(); err != nil {
+				t.Fatal(err)
+			}
+			closedRetired := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}, retired: true}
+			closedRetired.active.Store(17)
+			closedRetired.pending.Store(19)
+			if err := closedRetired.tunnel.Close(); err != nil {
+				t.Fatal(err)
+			}
+			proxy.mu.Lock()
+			proxy.tunnels = []*privateProxyTunnelState{live, retired, closed, closedRetired}
+			proxy.mu.Unlock()
+
+			payload, err := json.Marshal(proxy)
+			if err != nil {
+				t.Fatalf("marshal privateproxy: %v", err)
+			}
+			var document struct {
+				Type string                  `json:"type"`
+				ID   string                  `json:"id"`
+				Pool privateProxyPoolMetrics `json:"privateproxy_pool"`
+			}
+			if err := json.Unmarshal(payload, &document); err != nil {
+				t.Fatalf("unmarshal privateproxy: %v", err)
+			}
+			if document.Type != proxy.Type().String() || document.ID != proxy.Id() {
+				t.Fatalf("base identity: type=%q id=%q, want type=%q id=%q", document.Type, document.ID, proxy.Type().String(), proxy.Id())
+			}
+			if document.Pool.Transport != tt.wantTransport {
+				t.Errorf("transport: got %q, want %q", document.Pool.Transport, tt.wantTransport)
+			}
+			if document.Pool.SessionPoolLimit != 3 || document.Pool.MaxStreamsPerSession != 12 {
+				t.Errorf("pool limits: got %d/%d, want 3/12", document.Pool.SessionPoolLimit, document.Pool.MaxStreamsPerSession)
+			}
+			if document.Pool.SessionsLive != tt.wantLive || document.Pool.SessionsRetired != tt.wantRetired {
+				t.Errorf("sessions: got live=%d retired=%d, want live=%d retired=%d", document.Pool.SessionsLive, document.Pool.SessionsRetired, tt.wantLive, tt.wantRetired)
+			}
+			if document.Pool.StreamsActive != tt.wantActive || document.Pool.StreamsPending != tt.wantPending {
+				t.Errorf("streams: got active=%d pending=%d, want active=%d pending=%d", document.Pool.StreamsActive, document.Pool.StreamsPending, tt.wantActive, tt.wantPending)
+			}
+			for _, secret := range []string{"0123456789abcdef0123456789abcdef", "proxy.example.com:443", "example.com"} {
+				if strings.Contains(string(payload), secret) {
+					t.Errorf("JSON unexpectedly contains sensitive value %q: %s", secret, payload)
+				}
+			}
+		})
+	}
+}
+
+func TestPrivateProxyMarshalJSONTracksReservationBalance(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "json-reservation-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}}
+	proxy.mu.Lock()
+	proxy.tunnels = []*privateProxyTunnelState{state}
+	proxy.mu.Unlock()
+
+	reservation, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatalf("reserve tunnel: %v", err)
+	}
+	stages := []struct {
+		name        string
+		apply       func() bool
+		wantActive  int64
+		wantPending int64
+	}{
+		{name: "pending", wantPending: 1},
+		{
+			name: "active", apply: reservation.activate,
+			wantActive: 1,
+		},
+		{
+			name: "released", apply: func() bool {
+				reservation.release()
+				return true
+			},
+		},
+		{
+			name: "duplicate release", apply: func() bool {
+				reservation.release()
+				return true
+			},
+		},
+	}
+	for _, stage := range stages {
+		t.Run(stage.name, func(t *testing.T) {
+			if stage.apply != nil && !stage.apply() {
+				t.Fatal("reservation state transition failed")
+			}
+			metrics := marshalPrivateProxyPoolMetrics(t, proxy)
+			if metrics.StreamsActive != stage.wantActive || metrics.StreamsPending != stage.wantPending {
+				t.Fatalf("streams: got active=%d pending=%d, want active=%d pending=%d", metrics.StreamsActive, metrics.StreamsPending, stage.wantActive, stage.wantPending)
+			}
+		})
+	}
+}
+
+func TestPrivateProxyMarshalJSONConcurrentReservations(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "json-race-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 1,
+		MaxStreamsPerSession: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &privateProxyTunnelState{tunnel: &fakePrivateProxyTunnel{}}
+	proxy.mu.Lock()
+	proxy.tunnels = []*privateProxyTunnelState{state}
+	proxy.mu.Unlock()
+
+	const workers = 8
+	const iterations = 32
+	start := make(chan struct{})
+	errs := make(chan error, workers*iterations)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				reservation, err := proxy.reserveTunnel(context.Background())
+				if err != nil {
+					errs <- err
+					continue
+				}
+				if !reservation.activate() {
+					errs <- errors.New("reservation activation failed")
+					reservation.release()
+					continue
+				}
+				if _, err := json.Marshal(proxy); err != nil {
+					errs <- err
+				}
+				reservation.release()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := state.active.Load() + state.pending.Load(); got != 0 {
+		t.Fatalf("reservation counters leaked: %d", got)
+	}
+}
+
+func marshalPrivateProxyPoolMetrics(t *testing.T, proxy *PrivateProxy) privateProxyPoolMetrics {
+	t.Helper()
+	payload, err := json.Marshal(proxy)
+	if err != nil {
+		t.Fatalf("marshal privateproxy: %v", err)
+	}
+	var document struct {
+		Pool privateProxyPoolMetrics `json:"privateproxy_pool"`
+	}
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatalf("unmarshal privateproxy: %v", err)
+	}
+	return document.Pool
 }
 
 func TestPrivateProxyReservationsBalanceLeastLoadedTies(t *testing.T) {
@@ -1129,4 +1354,267 @@ func TestPrivateProxyUDPTunnelDrainsAfterPacketConnClose(t *testing.T) {
 	if !target.IsClosed() || target.closeCount() != 1 {
 		t.Fatalf("UDP drain close state: closed=%v calls=%d", target.IsClosed(), target.closeCount())
 	}
+}
+
+const (
+	privateProxyABTargetHost       = "example.com"
+	privateProxyABTargetPort       = 443
+	privateProxyABConcurrency      = 16
+	privateProxyABOperationTimeout = 5 * time.Second
+	privateProxyABGroupTimeout     = 60 * time.Second
+)
+
+// TestPrivateProxyV1SessionPoolABLive is an opt-in, sequential comparison of
+// the two V1 admission thresholds. It deliberately uses one fixed public TLS
+// target and no application download: the TLS handshakes plus the bounded
+// CONNECT control frames are enough to exercise concurrent yamux streams while
+// keeping the traffic well below the live-test budget.
+func TestPrivateProxyV1SessionPoolABLive(t *testing.T) {
+	if os.Getenv("PRIVATE_PROXY_AB_LIVE") != "1" {
+		t.Skip("set PRIVATE_PROXY_AB_LIVE=1 to run the live V1 A/B test")
+	}
+
+	cfg, ok := loadPrivateProxyABLiveConfig(t)
+	if !ok {
+		return
+	}
+
+	// Keep the groups strictly sequential so the measurements cannot compete
+	// for the same endpoint or contaminate one another's pool state.
+	a := runPrivateProxyV1ABGroup(t, cfg, "A", 8)
+	b := runPrivateProxyV1ABGroup(t, cfg, "B", 4)
+
+	t.Logf(
+		"privateproxy V1 A/B comparison target=%s p95_delta_B_minus_A=%v max_delta_B_minus_A=%v",
+		privateProxyABTargetHost,
+		b.p95-a.p95,
+		b.max-a.max,
+	)
+	if a.connectSuccess == 0 || b.connectSuccess == 0 {
+		t.Errorf("live V1 A/B produced no successful CONNECT in one or both groups")
+	}
+}
+
+type privateProxyABLiveConfig struct {
+	server string
+	port   int
+	sni    string
+	psk    string
+	nodeID int
+}
+
+// privateProxyABEnv prefers namespaced variables to avoid accidentally using
+// an unrelated process setting, while accepting the short names requested by
+// the operator-facing live-test contract.
+func privateProxyABEnv(name string) string {
+	if value := os.Getenv("PRIVATE_PROXY_AB_" + name); strings.TrimSpace(value) != "" {
+		return value
+	}
+	return os.Getenv(name)
+}
+
+func loadPrivateProxyABLiveConfig(t *testing.T) (privateProxyABLiveConfig, bool) {
+	t.Helper()
+	address := strings.TrimSpace(privateProxyABEnv("ADDRESS"))
+	sni := strings.TrimSpace(privateProxyABEnv("SNI"))
+	psk := privateProxyABEnv("PSK")
+	nodeIDText := strings.TrimSpace(privateProxyABEnv("NODE_ID"))
+	if address == "" || sni == "" || strings.TrimSpace(psk) == "" || nodeIDText == "" {
+		t.Skip("live V1 A/B requires ADDRESS, SNI, PSK, and NODE_ID")
+		return privateProxyABLiveConfig{}, false
+	}
+
+	server, port, ok := splitPrivateProxyABAddress(address)
+	if !ok {
+		t.Skip("live V1 A/B ADDRESS is invalid")
+		return privateProxyABLiveConfig{}, false
+	}
+	nodeID, err := strconv.ParseUint(nodeIDText, 10, 32)
+	if err != nil || nodeID == 0 {
+		t.Skip("live V1 A/B NODE_ID is invalid")
+		return privateProxyABLiveConfig{}, false
+	}
+	return privateProxyABLiveConfig{
+		server: server,
+		port:   port,
+		sni:    sni,
+		psk:    psk,
+		nodeID: int(nodeID),
+	}, true
+}
+
+func splitPrivateProxyABAddress(address string) (string, int, bool) {
+	if address == "" || strings.ContainsAny(address, "\r\n\t /") {
+		return "", 0, false
+	}
+	if host, portText, err := net.SplitHostPort(address); err == nil {
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 || host == "" {
+			return "", 0, false
+		}
+		return host, port, true
+	}
+	if strings.Count(address, ":") > 1 {
+		if net.ParseIP(address) == nil {
+			return "", 0, false
+		}
+		return address, 443, true
+	}
+	return address, 443, true
+}
+
+type privateProxyV1ABSample struct {
+	elapsed  time.Duration
+	success  bool
+	tlsProbe bool
+}
+
+type privateProxyV1ABGroupResult struct {
+	label          string
+	connectSuccess int
+	connectFailure int
+	tlsSuccess     int
+	tlsFailure     int
+	p50            time.Duration
+	p95            time.Duration
+	max            time.Duration
+	pool           privateProxyPoolMetrics
+}
+
+func runPrivateProxyV1ABGroup(t *testing.T, cfg privateProxyABLiveConfig, label string, maxStreams int) privateProxyV1ABGroupResult {
+	t.Helper()
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name:                 "privateproxy-v1-ab-" + label,
+		Server:               cfg.server,
+		Port:                 cfg.port,
+		PSK:                  cfg.psk,
+		SNI:                  cfg.sni,
+		NodeID:               cfg.nodeID,
+		SessionPool:          8,
+		MaxStreamsPerSession: maxStreams,
+	})
+	if err != nil {
+		t.Fatalf("live V1 A/B group %s could not initialize", label)
+	}
+	defer proxy.Close()
+
+	groupCtx, cancelGroup := context.WithTimeout(context.Background(), privateProxyABGroupTimeout)
+	defer cancelGroup()
+	start := make(chan struct{})
+	release := make(chan struct{})
+	attemptsDone := make(chan struct{}, privateProxyABConcurrency)
+	samples := make(chan privateProxyV1ABSample, privateProxyABConcurrency)
+	metadata := &C.Metadata{Host: privateProxyABTargetHost, DstPort: privateProxyABTargetPort}
+	var workers sync.WaitGroup
+	workers.Add(privateProxyABConcurrency)
+	for i := 0; i < privateProxyABConcurrency; i++ {
+		go func() {
+			defer workers.Done()
+			<-start
+
+			dialCtx, cancelDial := context.WithTimeout(groupCtx, privateProxyABOperationTimeout)
+			started := time.Now()
+			conn, dialErr := proxy.DialContext(dialCtx, metadata)
+			elapsed := time.Since(started)
+			cancelDial()
+			if dialErr != nil || conn == nil {
+				samples <- privateProxyV1ABSample{elapsed: elapsed}
+				attemptsDone <- struct{}{}
+				return
+			}
+
+			rawConn, ok := conn.(net.Conn)
+			if !ok {
+				_ = conn.Close()
+				samples <- privateProxyV1ABSample{elapsed: elapsed, success: true}
+				attemptsDone <- struct{}{}
+				return
+			}
+			_ = rawConn.SetDeadline(time.Now().Add(privateProxyABOperationTimeout))
+			probeCtx, cancelProbe := context.WithTimeout(groupCtx, privateProxyABOperationTimeout)
+			tlsConn := tls.Client(rawConn, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				ServerName: privateProxyABTargetHost,
+			})
+			probeErr := tlsConn.HandshakeContext(probeCtx)
+			cancelProbe()
+			samples <- privateProxyV1ABSample{
+				elapsed:  elapsed,
+				success:  true,
+				tlsProbe: probeErr == nil,
+			}
+			attemptsDone <- struct{}{}
+			if probeErr != nil {
+				_ = tlsConn.Close()
+				return
+			}
+
+			select {
+			case <-release:
+			case <-groupCtx.Done():
+			}
+			_ = tlsConn.Close()
+		}()
+	}
+	close(start)
+
+	for i := 0; i < privateProxyABConcurrency; i++ {
+		select {
+		case <-attemptsDone:
+		case <-groupCtx.Done():
+			t.Errorf("live V1 A/B group %s exceeded its bounded runtime", label)
+			i = privateProxyABConcurrency
+		}
+	}
+	close(release)
+	workers.Wait()
+	close(samples)
+
+	result := privateProxyV1ABGroupResult{label: label, pool: marshalPrivateProxyPoolMetrics(t, proxy)}
+	var latencies []time.Duration
+	for sample := range samples {
+		if !sample.success {
+			result.connectFailure++
+			continue
+		}
+		result.connectSuccess++
+		latencies = append(latencies, sample.elapsed)
+		if sample.tlsProbe {
+			result.tlsSuccess++
+		} else {
+			result.tlsFailure++
+		}
+	}
+	if len(latencies) > 0 {
+		result.p50 = privateProxyABPercentile(latencies, 50)
+		result.p95 = privateProxyABPercentile(latencies, 95)
+		result.max = latencies[0]
+		for _, latency := range latencies[1:] {
+			if latency > result.max {
+				result.max = latency
+			}
+		}
+	}
+	t.Logf(
+		"privateproxy V1 group=%s target=%s connect_success=%d connect_failure=%d tls_success=%d tls_failure=%d latency_samples=%d p50=%v p95=%v max=%v pool_transport=%s pool_session_limit=%d pool_max_streams=%d sessions_live=%d sessions_retired=%d streams_active=%d streams_pending=%d",
+		label, privateProxyABTargetHost, result.connectSuccess, result.connectFailure,
+		result.tlsSuccess, result.tlsFailure, len(latencies), result.p50, result.p95, result.max,
+		result.pool.Transport, result.pool.SessionPoolLimit, result.pool.MaxStreamsPerSession,
+		result.pool.SessionsLive, result.pool.SessionsRetired, result.pool.StreamsActive,
+		result.pool.StreamsPending,
+	)
+	return result
+}
+
+func privateProxyABPercentile(values []time.Duration, percentile int) time.Duration {
+	ordered := append([]time.Duration(nil), values...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	index := (len(ordered)*percentile+99)/100 - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(ordered) {
+		index = len(ordered) - 1
+	}
+	return ordered[index]
 }

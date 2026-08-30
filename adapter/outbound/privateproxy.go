@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -124,6 +125,61 @@ type PrivateProxy struct {
 	refillFail atomic.Uint32
 	refillAt   atomic.Int64
 	closed     bool
+}
+
+type privateProxyPoolMetrics struct {
+	Transport            string `json:"transport"`
+	SessionPoolLimit     int    `json:"session_pool_limit"`
+	MaxStreamsPerSession int    `json:"max_streams_per_session"`
+	SessionsLive         int    `json:"sessions_live"`
+	SessionsRetired      int    `json:"sessions_retired"`
+	StreamsActive        int64  `json:"streams_active"`
+	StreamsPending       int64  `json:"streams_pending"`
+}
+
+// MarshalJSON exposes the adapter identity and bounded pool state without
+// serializing connection addresses, credentials, destinations, or errors.
+func (p *PrivateProxy) MarshalJSON() ([]byte, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	transport := strings.ToLower(strings.TrimSpace(p.option.Transport))
+	if transport == "" {
+		transport = "tls-yamux"
+	}
+	metrics := privateProxyPoolMetrics{
+		Transport:            transport,
+		SessionPoolLimit:     p.option.SessionPool,
+		MaxStreamsPerSession: p.option.MaxStreamsPerSession,
+	}
+
+	for _, state := range p.tunnels {
+		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
+			continue
+		}
+		if state.retired {
+			metrics.SessionsRetired++
+		} else {
+			metrics.SessionsLive++
+		}
+		metrics.StreamsActive += state.active.Load()
+		metrics.StreamsPending += state.pending.Load()
+	}
+
+	baseJSON, err := p.Base.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	var base map[string]json.RawMessage
+	if err := json.Unmarshal(baseJSON, &base); err != nil {
+		return nil, err
+	}
+	poolJSON, err := json.Marshal(metrics)
+	if err != nil {
+		return nil, err
+	}
+	base["privateproxy_pool"] = poolJSON
+	return json.Marshal(base)
 }
 
 type privateProxyTunnel interface {
