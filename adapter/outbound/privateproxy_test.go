@@ -77,10 +77,11 @@ func (d *recordingDialer) ListenPacket(context.Context, string, string, netip.Ad
 }
 
 type scriptedPrivateProxyTunnel struct {
-	mu      sync.Mutex
-	closed  bool
-	dialErr error
-	streams int
+	mu         sync.Mutex
+	closed     bool
+	closeCalls int
+	dialErr    error
+	streams    int
 }
 
 func (t *scriptedPrivateProxyTunnel) DialContext(context.Context, string) (net.Conn, error) {
@@ -111,6 +112,7 @@ func (t *scriptedPrivateProxyTunnel) ListenPacketContext(context.Context) (net.P
 
 func (t *scriptedPrivateProxyTunnel) Close() error {
 	t.mu.Lock()
+	t.closeCalls++
 	t.closed = true
 	t.mu.Unlock()
 	return nil
@@ -126,6 +128,18 @@ func (t *scriptedPrivateProxyTunnel) NumStreams() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.streams
+}
+
+func (t *scriptedPrivateProxyTunnel) setDialErr(err error) {
+	t.mu.Lock()
+	t.dialErr = err
+	t.mu.Unlock()
+}
+
+func (t *scriptedPrivateProxyTunnel) closeCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closeCalls
 }
 
 type dialResultPrivateProxyTunnel struct {
@@ -982,5 +996,137 @@ func TestPrivateProxyEvictsControlPlaneFailuresButNotConnectErrors(t *testing.T)
 				t.Fatal("healthy replacement must remain in the pool")
 			}
 		})
+	}
+}
+
+func TestPrivateProxyControlFailureDrainsActiveSibling(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "drain-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	first := &scriptedPrivateProxyTunnel{}
+	replacement := &scriptedPrivateProxyTunnel{}
+	dials := 0
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		dials++
+		switch dials {
+		case 1:
+			return first, nil
+		case 2:
+			return replacement, nil
+		default:
+			return nil, errors.New("unexpected extra drain-test dial")
+		}
+	}
+
+	sibling, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sibling.tunnel() != first || !sibling.activate() {
+		t.Fatal("failed to establish active sibling reservation")
+	}
+	first.setDialErr(errors.Join(errors.New("read header"), tunnel.ErrControlPlaneFailure))
+
+	metadata := &C.Metadata{Host: "example.com", DstPort: 443}
+	conn, err := proxy.DialContext(context.Background(), metadata)
+	if err != nil {
+		t.Fatalf("replacement dial: %v", err)
+	}
+	if conn == nil || dials != 2 {
+		t.Fatalf("replacement state: conn=%v dials=%d", conn, dials)
+	}
+	_ = conn.Close()
+	if first.IsClosed() || first.closeCount() != 0 {
+		t.Fatal("retired tunnel closed while an active sibling remained")
+	}
+
+	lease, err := proxy.reserveTunnel(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.tunnel() != replacement {
+		t.Fatal("retired tunnel was selected for new traffic")
+	}
+	lease.release()
+
+	sibling.release()
+	if !first.IsClosed() || first.closeCount() != 1 {
+		t.Fatalf("drained tunnel close state: closed=%v calls=%d", first.IsClosed(), first.closeCount())
+	}
+	proxy.mu.RLock()
+	for _, state := range proxy.tunnels {
+		if state == sibling.state {
+			proxy.mu.RUnlock()
+			t.Fatal("drained tunnel remained in the pool")
+		}
+	}
+	proxy.mu.RUnlock()
+}
+
+func TestPrivateProxyRetiredTunnelWaitsForPendingReservation(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "pending-drain-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", SessionPool: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	target := &scriptedPrivateProxyTunnel{}
+	state := &privateProxyTunnelState{tunnel: target}
+	state.pending.Store(1)
+	proxy.tunnels = []*privateProxyTunnelState{state}
+	reservation := &privateProxyTunnelReservation{owner: proxy, state: state}
+
+	proxy.retireTunnel(state)
+	if target.IsClosed() {
+		t.Fatal("retired tunnel closed before its pending reservation finished")
+	}
+	reservation.release()
+	if !target.IsClosed() || target.closeCount() != 1 {
+		t.Fatalf("pending drain close state: closed=%v calls=%d", target.IsClosed(), target.closeCount())
+	}
+}
+
+func TestPrivateProxyUDPTunnelDrainsAfterPacketConnClose(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "udp-drain-test", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef", Transport: "http3", SessionPool: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	target := &scriptedPrivateProxyTunnel{}
+	proxy.dialTunnel = func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error) {
+		return target, nil
+	}
+	metadata := &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("8.8.8.8"), DstPort: 53}
+	packetConn, err := proxy.ListenPacketContext(context.Background(), metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.RLock()
+	state := proxy.tunnels[0]
+	proxy.mu.RUnlock()
+	if state.active.Load() != 1 {
+		t.Fatalf("active UDP association count: got %d, want 1", state.active.Load())
+	}
+
+	proxy.retireTunnel(state)
+	if target.IsClosed() {
+		t.Fatal("retired UDP tunnel closed while its packet connection remained active")
+	}
+	_ = packetConn.Close()
+	if !target.IsClosed() || target.closeCount() != 1 {
+		t.Fatalf("UDP drain close state: closed=%v calls=%d", target.IsClosed(), target.closeCount())
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,9 +45,72 @@ type PrivateProxyOption struct {
 }
 
 type privateProxyTunnelState struct {
-	tunnel  privateProxyTunnel
-	pending atomic.Int64
+	tunnel    privateProxyTunnel
+	pending   atomic.Int64
+	active    atomic.Int64
+	retired   bool
+	closeOnce sync.Once
+	closeErr  error
 }
+
+func (s *privateProxyTunnelState) close() error {
+	if s == nil || s.tunnel == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() { s.closeErr = s.tunnel.Close() })
+	return s.closeErr
+}
+
+type privateProxyConn struct {
+	C.Conn
+	closeFunc func()
+	closeOnce sync.Once
+}
+
+func (c *privateProxyConn) Close() error {
+	err := c.Conn.Close()
+	c.closeOnce.Do(c.closeFunc)
+	return err
+}
+
+func (c *privateProxyConn) AddRef(ref any) {
+	if conn, ok := c.Conn.(AddRef); ok {
+		conn.AddRef(ref)
+	}
+}
+
+func (c *privateProxyConn) ReaderReplaceable() bool { return true }
+func (c *privateProxyConn) WriterReplaceable() bool { return true }
+func (c *privateProxyConn) Upstream() any           { return c.Conn }
+
+type privateProxyPacketConn struct {
+	C.PacketConn
+	closeFunc func()
+	closeOnce sync.Once
+}
+
+var (
+	_ C.Conn       = (*privateProxyConn)(nil)
+	_ C.PacketConn = (*privateProxyPacketConn)(nil)
+	_ AddRef       = (*privateProxyConn)(nil)
+	_ AddRef       = (*privateProxyPacketConn)(nil)
+)
+
+func (c *privateProxyPacketConn) Close() error {
+	err := c.PacketConn.Close()
+	c.closeOnce.Do(c.closeFunc)
+	return err
+}
+
+func (c *privateProxyPacketConn) AddRef(ref any) {
+	if conn, ok := c.PacketConn.(AddRef); ok {
+		conn.AddRef(ref)
+	}
+}
+
+func (c *privateProxyPacketConn) ReaderReplaceable() bool { return true }
+func (c *privateProxyPacketConn) WriterReplaceable() bool { return true }
+func (c *privateProxyPacketConn) Upstream() any           { return c.PacketConn }
 
 type PrivateProxy struct {
 	*Base
@@ -73,8 +135,11 @@ type privateProxyTunnel interface {
 }
 
 type privateProxyTunnelReservation struct {
-	state *privateProxyTunnelState
-	once  sync.Once
+	owner    *PrivateProxy
+	state    *privateProxyTunnelState
+	mu       sync.Mutex
+	active   bool
+	released bool
 }
 
 func (r *privateProxyTunnelReservation) tunnel() privateProxyTunnel {
@@ -88,7 +153,39 @@ func (r *privateProxyTunnelReservation) release() {
 	if r == nil || r.state == nil {
 		return
 	}
-	r.once.Do(func() { r.state.pending.Add(-1) })
+	r.mu.Lock()
+	if r.released {
+		r.mu.Unlock()
+		return
+	}
+	if r.active {
+		r.state.active.Add(-1)
+	} else {
+		r.state.pending.Add(-1)
+	}
+	r.released = true
+	r.mu.Unlock()
+	if r.owner != nil {
+		r.owner.closeRetiredIfDrained(r.state)
+	}
+}
+
+// activate converts a pending reservation into an active stream. The active
+// count is incremented before pending is decremented so a retired tunnel
+// cannot be closed in the gap between the two state changes.
+func (r *privateProxyTunnelReservation) activate() bool {
+	if r == nil || r.state == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released || r.active {
+		return false
+	}
+	r.state.active.Add(1)
+	r.state.pending.Add(-1)
+	r.active = true
+	return true
 }
 
 type privateProxyTunnelDialer func(context.Context, tunnel.ServerEntry, string) (privateProxyTunnel, error)
@@ -179,27 +276,24 @@ func (p *PrivateProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C
 		return nil, fmt.Errorf("privateproxy tunnel: %w", err)
 	}
 	t := reservation.tunnel()
-	defer reservation.release()
 	if metadata == nil || t == nil {
+		reservation.release()
 		return nil, errors.New("privateproxy: tunnel or metadata is nil")
 	}
 
 	dest := metadata.RemoteAddress()
-	conn, err := t.DialContext(ctx, dest)
-	reservation.release()
-	if err != nil && shouldRetryPrivateProxyDial(t, err) && ctx.Err() == nil {
-		// A dead pooled session should not poison subsequent streams. Remove it
-		// and retry once on another (or newly created) on-demand session.
-		p.removeTunnel(t)
+	conn, err := p.dialReserved(ctx, dest, reservation)
+	if err != nil && p.finishFailedReservation(ctx, reservation, err) {
+		// A failed pooled session should not receive new streams. Retire it and
+		// retry once on another (or newly created) on-demand session while any
+		// established sibling streams drain.
 		if replacementReservation, replacementErr := p.reserveTunnel(ctx); replacementErr == nil {
-			replacement := replacementReservation.tunnel()
-			conn, err = replacement.DialContext(ctx, dest)
-			replacementReservation.release()
-			if err != nil && shouldRetryPrivateProxyDial(replacement, err) {
+			conn, err = p.dialReserved(ctx, dest, replacementReservation)
+			if err != nil {
 				// Do not leave a replacement that failed during the control
 				// plane handshake in the pool. This is cleanup only; the
 				// request still gets at most one retry.
-				p.removeTunnel(replacement)
+				p.finishFailedReservation(ctx, replacementReservation, err)
 			}
 		}
 	}
@@ -207,7 +301,40 @@ func (p *PrivateProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C
 		log.Errorln("privateproxy: dial %s: %v", dest, err)
 		return nil, fmt.Errorf("dial %s: %w", dest, err)
 	}
-	return NewConn(conn, p), nil
+	return conn, nil
+}
+
+func (p *PrivateProxy) dialReserved(ctx context.Context, dest string, reservation *privateProxyTunnelReservation) (C.Conn, error) {
+	if reservation == nil || reservation.tunnel() == nil {
+		return nil, errors.New("privateproxy: tunnel reservation is nil")
+	}
+	conn, err := reservation.tunnel().DialContext(ctx, dest)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, errors.New("privateproxy: tunnel returned nil connection")
+	}
+	if !reservation.activate() {
+		_ = conn.Close()
+		return nil, errors.New("privateproxy: tunnel reservation was released")
+	}
+	return &privateProxyConn{Conn: NewConn(conn, p), closeFunc: reservation.release}, nil
+}
+
+// finishFailedReservation retires an unusable session before releasing the
+// caller's pending reservation. This ordering prevents another caller from
+// selecting the failed session in the gap between those operations.
+func (p *PrivateProxy) finishFailedReservation(ctx context.Context, reservation *privateProxyTunnelReservation, err error) bool {
+	contextActive := ctx == nil || ctx.Err() == nil
+	retry := reservation != nil && shouldRetryPrivateProxyDial(reservation.tunnel(), err) && contextActive
+	if retry {
+		p.retireTunnel(reservation.state)
+	}
+	if reservation != nil {
+		reservation.release()
+	}
+	return retry
 }
 
 func shouldRetryPrivateProxyDial(t privateProxyTunnel, err error) bool {
@@ -215,6 +342,9 @@ func shouldRetryPrivateProxyDial(t privateProxyTunnel, err error) bool {
 }
 
 func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !p.SupportUDP() {
 		return nil, fmt.Errorf("privateproxy: UDP requires transport http3")
 	}
@@ -229,26 +359,41 @@ func (p *PrivateProxy) ListenPacketContext(ctx context.Context, metadata *C.Meta
 		return nil, fmt.Errorf("privateproxy UDP tunnel: %w", err)
 	}
 	t := reservation.tunnel()
-	packetConn, err := t.ListenPacketContext(ctx)
-	reservation.release()
-	if err != nil && shouldRetryPrivateProxyDial(t, err) && ctx.Err() == nil {
-		p.removeTunnel(t)
+	if t == nil {
+		reservation.release()
+		return nil, errors.New("privateproxy UDP tunnel is nil")
+	}
+	packetConn, err := p.listenPacketReserved(ctx, reservation)
+	if err != nil && p.finishFailedReservation(ctx, reservation, err) {
 		if replacementReservation, replacementErr := p.reserveTunnel(ctx); replacementErr == nil {
-			replacement := replacementReservation.tunnel()
-			packetConn, err = replacement.ListenPacketContext(ctx)
-			replacementReservation.release()
-			if err != nil && shouldRetryPrivateProxyDial(replacement, err) {
-				p.removeTunnel(replacement)
+			packetConn, err = p.listenPacketReserved(ctx, replacementReservation)
+			if err != nil {
+				p.finishFailedReservation(ctx, replacementReservation, err)
 			}
 		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("privateproxy UDP association: %w", err)
 	}
-	if packetConn == nil {
-		return nil, errors.New("privateproxy UDP association returned nil")
+	return packetConn, nil
+}
+
+func (p *PrivateProxy) listenPacketReserved(ctx context.Context, reservation *privateProxyTunnelReservation) (C.PacketConn, error) {
+	if reservation == nil || reservation.tunnel() == nil {
+		return nil, errors.New("privateproxy UDP tunnel reservation is nil")
 	}
-	return NewPacketConn(packetConn, p), nil
+	packetConn, err := reservation.tunnel().ListenPacketContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if packetConn == nil {
+		return nil, errors.New("privateproxy UDP tunnel returned nil packet connection")
+	}
+	if !reservation.activate() {
+		_ = packetConn.Close()
+		return nil, errors.New("privateproxy UDP tunnel reservation was released")
+	}
+	return &privateProxyPacketConn{PacketConn: NewPacketConn(packetConn, p), closeFunc: reservation.release}, nil
 }
 
 func (p *PrivateProxy) getOrCreateTunnel(ctx context.Context) (privateProxyTunnel, error) {
@@ -289,7 +434,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 		if best != nil && (bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool) {
 			best.pending.Add(1)
 			p.mu.Unlock()
-			return &privateProxyTunnelReservation{state: best}, nil
+			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		if live >= p.option.SessionPool {
 			// Defensive fallback for a zero/invalid threshold; normal validation
@@ -297,7 +442,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			if best != nil {
 				best.pending.Add(1)
 				p.mu.Unlock()
-				return &privateProxyTunnelReservation{state: best}, nil
+				return &privateProxyTunnelReservation{owner: p, state: best}, nil
 			}
 			p.mu.Unlock()
 			return nil, net.ErrClosed
@@ -305,7 +450,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 		if best != nil && p.refillCoolingDown() {
 			best.pending.Add(1)
 			p.mu.Unlock()
-			return &privateProxyTunnelReservation{state: best}, nil
+			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		p.mu.Unlock()
 
@@ -321,7 +466,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 				(bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool || p.refillCoolingDown()) {
 				best.pending.Add(1)
 				p.mu.Unlock()
-				return &privateProxyTunnelReservation{state: best}, nil
+				return &privateProxyTunnelReservation{owner: p, state: best}, nil
 			}
 			closed := p.closed
 			p.mu.Unlock()
@@ -344,14 +489,14 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			best.pending.Add(1)
 			p.mu.Unlock()
 			p.dialMu.Unlock()
-			return &privateProxyTunnelReservation{state: best}, nil
+			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		if live >= p.option.SessionPool {
 			if best != nil {
 				best.pending.Add(1)
 				p.mu.Unlock()
 				p.dialMu.Unlock()
-				return &privateProxyTunnelReservation{state: best}, nil
+				return &privateProxyTunnelReservation{owner: p, state: best}, nil
 			}
 			p.mu.Unlock()
 			p.dialMu.Unlock()
@@ -361,7 +506,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			best.pending.Add(1)
 			p.mu.Unlock()
 			p.dialMu.Unlock()
-			return &privateProxyTunnelReservation{state: best}, nil
+			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		poolIndex := live + 1
 		p.mu.Unlock()
@@ -404,7 +549,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			best.pending.Add(1)
 			p.mu.Unlock()
 			log.Warnln("privateproxy: session pool refill failed for %s; reusing a healthy session for %s: %v", p.addr, backoff, err)
-			return &privateProxyTunnelReservation{state: best}, nil
+			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		closed := p.closed
 		p.mu.Unlock()
@@ -418,7 +563,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 func (p *PrivateProxy) bestSessionLocked() (best *privateProxyTunnelState, live, bestLoad int) {
 	bestLoad = int(^uint(0) >> 1)
 	for _, state := range p.tunnels {
-		if state == nil || state.tunnel == nil || state.tunnel.IsClosed() {
+		if state == nil || state.retired || state.tunnel == nil || state.tunnel.IsClosed() {
 			continue
 		}
 		live++
@@ -499,30 +644,54 @@ func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
 	return entry
 }
 
-func (p *PrivateProxy) removeTunnel(target privateProxyTunnel) {
+func (p *PrivateProxy) retireTunnel(target *privateProxyTunnelState) {
+	if target == nil || target.tunnel == nil {
+		return
+	}
+	var closeTarget *privateProxyTunnelState
 	p.mu.Lock()
 	live := p.tunnels[:0]
 	for _, state := range p.tunnels {
-		if state == nil || !samePrivateProxyTunnel(state.tunnel, target) {
+		if state != target {
+			live = append(live, state)
+			continue
+		}
+		state.retired = true
+		if state.tunnel.IsClosed() || (state.pending.Load() == 0 && state.active.Load() == 0) {
+			closeTarget = state
+		} else {
 			live = append(live, state)
 		}
 	}
 	p.tunnels = live
 	p.mu.Unlock()
-	if target != nil {
-		_ = target.Close()
+	if closeTarget != nil {
+		_ = closeTarget.close()
 	}
 }
 
-func samePrivateProxyTunnel(a, b privateProxyTunnel) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
+func (p *PrivateProxy) closeRetiredIfDrained(target *privateProxyTunnelState) {
+	if target == nil || target.tunnel == nil {
+		return
 	}
-	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
-	if ta != tb || !ta.Comparable() {
-		return false
+	var closeTarget *privateProxyTunnelState
+	p.mu.Lock()
+	if target.retired && (target.tunnel.IsClosed() ||
+		(target.pending.Load() == 0 && target.active.Load() == 0)) {
+		live := p.tunnels[:0]
+		for _, state := range p.tunnels {
+			if state == target {
+				closeTarget = state
+				continue
+			}
+			live = append(live, state)
+		}
+		p.tunnels = live
 	}
-	return a == b
+	p.mu.Unlock()
+	if closeTarget != nil {
+		_ = closeTarget.close()
+	}
 }
 
 func (p *PrivateProxy) SupportUDP() bool {
@@ -533,7 +702,7 @@ func (p *PrivateProxy) Alive() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, state := range p.tunnels {
-		if state != nil && state.tunnel != nil && !state.tunnel.IsClosed() {
+		if state != nil && !state.retired && state.tunnel != nil && !state.tunnel.IsClosed() {
 			return true
 		}
 	}
@@ -551,7 +720,7 @@ func (p *PrivateProxy) Close() error {
 	var firstErr error
 	for _, state := range tunnels {
 		if state != nil && state.tunnel != nil {
-			if err := state.tunnel.Close(); err != nil && firstErr == nil {
+			if err := state.close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
