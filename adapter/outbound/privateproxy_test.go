@@ -747,6 +747,46 @@ func TestNewPrivateProxyValidatesSessionPool(t *testing.T) {
 	}
 }
 
+func TestNewPrivateProxyValidatesPortAndNodeID(t *testing.T) {
+	maxNodeID := int(^uint32(0))
+	tests := []struct {
+		name   string
+		change func(*PrivateProxyOption)
+		valid  bool
+	}{
+		{name: "default", change: func(option *PrivateProxyOption) {}, valid: true},
+		{name: "port minimum", change: func(option *PrivateProxyOption) { option.Port = 1 }, valid: true},
+		{name: "port maximum", change: func(option *PrivateProxyOption) { option.Port = 65535 }, valid: true},
+		{name: "port negative", change: func(option *PrivateProxyOption) { option.Port = -1 }},
+		{name: "port too large", change: func(option *PrivateProxyOption) { option.Port = 65536 }},
+		{name: "node minimum", change: func(option *PrivateProxyOption) { option.NodeID = 1 }, valid: true},
+		{name: "node maximum", change: func(option *PrivateProxyOption) { option.NodeID = maxNodeID }, valid: true},
+		{name: "node negative", change: func(option *PrivateProxyOption) { option.NodeID = -1 }},
+		{name: "node too large", change: func(option *PrivateProxyOption) { option.NodeID = maxNodeID + 1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			option := PrivateProxyOption{
+				Name: "range-test", Server: "proxy.example.com",
+				PSK: "0123456789abcdef0123456789abcdef",
+			}
+			tt.change(&option)
+			proxy, err := NewPrivateProxy(option)
+			if tt.valid {
+				if err != nil {
+					t.Fatalf("valid option rejected: %v", err)
+				}
+				_ = proxy.Close()
+				return
+			}
+			if err == nil {
+				_ = proxy.Close()
+				t.Fatal("invalid option accepted")
+			}
+		})
+	}
+}
+
 func TestNewPrivateProxyValidatesMaxStreamsPerSession(t *testing.T) {
 	for _, size := range []int{-1, maxMaxStreamsPerSession + 1} {
 		_, err := NewPrivateProxy(PrivateProxyOption{
@@ -1024,6 +1064,142 @@ func TestPrivateProxyBackpressuresWhenOnlyLiveSessionIsAtThreshold(t *testing.T)
 		lease.release()
 	case <-time.After(time.Second):
 		t.Fatal("waiting reservation did not resume after refill")
+	}
+}
+
+func TestPrivateProxyReserveHonorsContextWhileRefillIsLocked(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "refill-lock-context", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	if !proxy.tryLockDial() {
+		t.Fatal("failed to occupy refill lock")
+	}
+	defer proxy.unlockDial()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = proxy.reserveTunnel(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reserve error: got %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("reserve ignored context for %v", elapsed)
+	}
+}
+
+func TestPrivateProxyCloseCancelsRefill(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "close-refill", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialStarted := make(chan struct{})
+	dialCanceled := make(chan struct{})
+	finishDial := make(chan struct{})
+	releaseDial := sync.OnceFunc(func() { close(finishDial) })
+	defer releaseDial()
+	proxy.dialTunnel = func(ctx context.Context, _ tunnel.ServerEntry, _ string) (privateProxyTunnel, error) {
+		close(dialStarted)
+		<-ctx.Done()
+		close(dialCanceled)
+		<-finishDial
+		return nil, ctx.Err()
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, dialErr := proxy.reserveTunnel(context.Background())
+		result <- dialErr
+	}()
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		_ = proxy.Close()
+		t.Fatal("refill did not start")
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- proxy.Close() }()
+	select {
+	case <-dialCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel refill context")
+	}
+	waiterResult := make(chan error, 1)
+	go func() {
+		_, err := proxy.reserveTunnel(context.Background())
+		waiterResult <- err
+	}()
+	select {
+	case err := <-waiterResult:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("waiting reserve after Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed adapter retained a refill waiter")
+	}
+	select {
+	case <-closeResult:
+		t.Fatal("Close returned before refill cleanup finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseDial()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Close did not return after canceling refill")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("reserve after Close: got %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refill did not finish after Close")
+	}
+}
+
+func TestPrivateProxyConcurrentClose(t *testing.T) {
+	proxy, err := NewPrivateProxy(PrivateProxyOption{
+		Name: "concurrent-close", Server: "proxy.example.com",
+		PSK: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &scriptedPrivateProxyTunnel{}
+	proxy.mu.Lock()
+	proxy.tunnels = []*privateProxyTunnelState{{tunnel: target}}
+	proxy.mu.Unlock()
+
+	const closers = 16
+	results := make(chan error, closers)
+	var group sync.WaitGroup
+	group.Add(closers)
+	for i := 0; i < closers; i++ {
+		go func() {
+			defer group.Done()
+			results <- proxy.Close()
+		}()
+	}
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("concurrent Close: %v", err)
+		}
+	}
+	if got := target.closeCount(); got != 1 {
+		t.Fatalf("tunnel close calls: got %d, want 1", got)
 	}
 }
 
