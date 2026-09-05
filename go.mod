@@ -65,7 +65,7 @@ require (
 // lastest version compatible with golang1.20
 require (
 	github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905
-	github.com/klauspost/compress v1.17.9
+	github.com/klauspost/compress v1.18.7
 	github.com/mdlayher/netlink v1.7.2
 	github.com/miekg/dns v1.1.63
 	github.com/oschwald/maxminddb-golang v1.12.0
@@ -156,6 +156,6 @@ require (
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
 
-replace github.com/metacubex/yamux => github.com/steinscc/yamux v0.0.0-20260825103442-9ea90be7ad03
+replace github.com/metacubex/yamux => github.com/steinscc/yamux v0.0.0-20260825172448-39d789c0502f
 
 replace private_proxy => ../..

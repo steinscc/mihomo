@@ -118,13 +118,17 @@ type PrivateProxy struct {
 	option PrivateProxyOption
 	addr   string
 
-	mu         sync.RWMutex
-	dialMu     sync.Mutex
-	tunnels    []*privateProxyTunnelState
-	dialTunnel privateProxyTunnelDialer
-	refillFail atomic.Uint32
-	refillAt   atomic.Int64
-	closed     bool
+	mu          sync.RWMutex
+	dialMu      chan struct{}
+	closeCtx    context.Context
+	closeCancel context.CancelFunc
+	closeOnce   sync.Once
+	closeErr    error
+	tunnels     []*privateProxyTunnelState
+	dialTunnel  privateProxyTunnelDialer
+	refillFail  atomic.Uint32
+	refillAt    atomic.Int64
+	closed      bool
 }
 
 type privateProxyPoolMetrics struct {
@@ -266,11 +270,17 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 	if option.Port == 0 {
 		option.Port = 443
 	}
+	if option.Port < 1 || option.Port > 65535 {
+		return nil, fmt.Errorf("privateproxy: port must be between 1 and 65535")
+	}
 	if option.SNI == "" {
 		option.SNI = option.Server
 	}
 	if option.NodeID == 0 {
 		option.NodeID = 1
+	}
+	if option.NodeID < 1 || uint64(option.NodeID) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("privateproxy: node_id must be between 1 and %d", ^uint32(0))
 	}
 	if err := tunnel.ValidateSPKIPins(option.SPKIPins); err != nil {
 		return nil, fmt.Errorf("privateproxy: %w", err)
@@ -293,6 +303,7 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 
 	addr := net.JoinHostPort(option.Server, fmt.Sprintf("%d", option.Port))
 	udpEnabled := strings.EqualFold(strings.TrimSpace(option.Transport), "http3")
+	closeCtx, closeCancel := context.WithCancel(context.Background())
 	p := &PrivateProxy{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -306,11 +317,13 @@ func NewPrivateProxy(option PrivateProxyOption) (*PrivateProxy, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		option: option, addr: addr,
+		option: option, addr: addr, dialMu: make(chan struct{}, 1),
+		closeCtx: closeCtx, closeCancel: closeCancel,
 		dialTunnel: func(ctx context.Context, entry tunnel.ServerEntry, psk string) (privateProxyTunnel, error) {
 			return tunnel.DialTunnelContext(ctx, entry, psk)
 		},
 	}
+	p.dialMu <- struct{}{}
 
 	// The control-plane connection is an outbound connection too. Build it
 	// through Mihomo's configured dialer so interface binding, routing marks,
@@ -514,7 +527,7 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 		// when a live session is below the admission threshold. If all sessions
 		// are full, waiting for the one shared refill provides backpressure instead
 		// of overloading the same TCP writer while a replacement is being created.
-		if !p.dialMu.TryLock() {
+		if !p.tryLockDial() {
 			p.mu.Lock()
 			p.pruneClosedLocked()
 			best, live, bestLoad = p.bestSessionLocked()
@@ -529,7 +542,13 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			if closed {
 				return nil, net.ErrClosed
 			}
-			p.dialMu.Lock()
+			if err := p.lockDial(ctx); err != nil {
+				return nil, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			p.unlockDial()
+			return nil, err
 		}
 		// Re-check capacity after acquiring the lock: another caller may have
 		// opened a session while this caller waited.
@@ -537,31 +556,31 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 		p.pruneClosedLocked()
 		if p.closed {
 			p.mu.Unlock()
-			p.dialMu.Unlock()
+			p.unlockDial()
 			return nil, net.ErrClosed
 		}
 		best, live, bestLoad = p.bestSessionLocked()
 		if best != nil && (bestLoad < p.option.MaxStreamsPerSession || live >= p.option.SessionPool) {
 			best.pending.Add(1)
 			p.mu.Unlock()
-			p.dialMu.Unlock()
+			p.unlockDial()
 			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		if live >= p.option.SessionPool {
 			if best != nil {
 				best.pending.Add(1)
 				p.mu.Unlock()
-				p.dialMu.Unlock()
+				p.unlockDial()
 				return &privateProxyTunnelReservation{owner: p, state: best}, nil
 			}
 			p.mu.Unlock()
-			p.dialMu.Unlock()
+			p.unlockDial()
 			return nil, net.ErrClosed
 		}
 		if best != nil && p.refillCoolingDown() {
 			best.pending.Add(1)
 			p.mu.Unlock()
-			p.dialMu.Unlock()
+			p.unlockDial()
 			return &privateProxyTunnelReservation{owner: p, state: best}, nil
 		}
 		poolIndex := live + 1
@@ -569,7 +588,9 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 
 		entry := p.serverEntry()
 		log.Infoln("privateproxy: connecting to %s on demand (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
-		t, err := p.dialTunnel(ctx, entry, p.option.PSK)
+		dialCtx, stopDialContext := p.contextWithClose(ctx)
+		t, err := p.dialTunnel(dialCtx, entry, p.option.PSK)
+		stopDialContext()
 		if err == nil && t == nil {
 			err = errors.New("privateproxy: tunnel dialer returned a nil session")
 		}
@@ -582,17 +603,17 @@ func (p *PrivateProxy) reserveTunnel(ctx context.Context) (*privateProxyTunnelRe
 			}
 			p.mu.Unlock()
 			if closed {
-				p.dialMu.Unlock()
 				_ = t.Close()
+				p.unlockDial()
 				return nil, net.ErrClosed
 			}
 			log.Infoln("privateproxy: tunnel to %s ready (session %d/%d)", p.addr, poolIndex, p.option.SessionPool)
-			p.dialMu.Unlock()
+			p.unlockDial()
 			// Loop once so the newly created session receives the reservation.
 			continue
 		}
 		backoff := p.noteRefillFailure()
-		p.dialMu.Unlock()
+		p.unlockDial()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -666,6 +687,42 @@ func (p *PrivateProxy) noteRefillFailure() time.Duration {
 func (p *PrivateProxy) resetRefillBackoff() {
 	p.refillFail.Store(0)
 	p.refillAt.Store(0)
+}
+
+func (p *PrivateProxy) tryLockDial() bool {
+	select {
+	case <-p.dialMu:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *PrivateProxy) lockDial(ctx context.Context) error {
+	select {
+	case <-p.dialMu:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closeCtx.Done():
+		return net.ErrClosed
+	}
+}
+
+func (p *PrivateProxy) unlockDial() {
+	p.dialMu <- struct{}{}
+}
+
+func (p *PrivateProxy) contextWithClose(ctx context.Context) (context.Context, func()) {
+	if p.closeCtx == nil {
+		return ctx, func() {}
+	}
+	dialCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(p.closeCtx, cancel)
+	return dialCtx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (p *PrivateProxy) serverEntry() tunnel.ServerEntry {
@@ -766,20 +823,29 @@ func (p *PrivateProxy) Alive() bool {
 }
 
 func (p *PrivateProxy) Close() error {
-	p.dialMu.Lock()
-	defer p.dialMu.Unlock()
-	p.mu.Lock()
-	p.closed = true
-	tunnels := p.tunnels
-	p.tunnels = nil
-	p.mu.Unlock()
-	var firstErr error
-	for _, state := range tunnels {
-		if state != nil && state.tunnel != nil {
-			if err := state.close(); err != nil && firstErr == nil {
-				firstErr = err
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		tunnels := p.tunnels
+		p.tunnels = nil
+		cancel := p.closeCancel
+		p.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		for _, state := range tunnels {
+			if state != nil && state.tunnel != nil {
+				if err := state.close(); err != nil && p.closeErr == nil {
+					p.closeErr = err
+				}
 			}
 		}
-	}
-	return firstErr
+		// Cancellation interrupts the current refill. Wait for its resources to
+		// be released before reporting that this adapter has closed.
+		if p.dialMu != nil {
+			<-p.dialMu
+			p.unlockDial()
+		}
+	})
+	return p.closeErr
 }
